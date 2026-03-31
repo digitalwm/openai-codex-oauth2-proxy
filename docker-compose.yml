@@ -1,0 +1,13 @@
+services:
+  codex-openai-proxy:
+    build: .
+    image: codex-openai-proxy:local
+    ports:
+      - "28080:8080"
+    environment:
+      AUTH_PATHS: /run/auth/karla.json,/run/auth/lucia.json,/run/auth/dan.json
+      PROXY_BEARER_TOKEN: ${PROXY_BEARER_TOKEN:-}
+    volumes:
+      - ./auth/dan.json:/run/auth/dan.json
+      - ./auth/lucia.json:/run/auth/lucia.json
+      - ./auth/karla.json:/run/auth/karla.json

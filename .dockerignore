@@ -1,0 +1,6 @@
+.git
+.gitignore
+target
+auth
+*.json
+!Cargo.toml

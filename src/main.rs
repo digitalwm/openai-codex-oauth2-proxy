@@ -1,12 +1,16 @@
-use anyhow::{Context, Result};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{anyhow, bail, Context, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use chrono::{DateTime, Utc};
 use clap::Parser;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use warp::{Filter, Reply};
-use reqwest::Client;
+use tokio::sync::Mutex;
 use uuid::Uuid;
-
-mod improved_response;
+use warp::{Filter, Reply};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -15,13 +19,23 @@ struct Args {
     #[arg(short, long, default_value = "8080")]
     port: u16,
 
-    /// Path to Codex auth.json file
-    #[arg(long, default_value = "~/.codex/auth.json")]
-    auth_path: String,
+    /// Path(s) to auth.json files. Repeat the flag or use AUTH_PATHS with commas.
+    #[arg(
+        long = "auth-path",
+        env = "AUTH_PATHS",
+        value_delimiter = ',',
+        num_args = 1..,
+        default_value = "~/.codex/auth.json"
+    )]
+    auth_paths: Vec<String>,
+
+    /// Optional bearer token required from clients calling this proxy.
+    #[arg(long, env = "PROXY_BEARER_TOKEN")]
+    proxy_bearer_token: Option<String>,
 }
 
-/// Chat Completions API format (what CLINE sends)
-#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+#[derive(Deserialize, Debug, Clone)]
 struct ChatCompletionsRequest {
     model: String,
     messages: Vec<ChatMessage>,
@@ -32,13 +46,12 @@ struct ChatCompletionsRequest {
     tool_choice: Option<Value>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 struct ChatMessage {
     role: String,
-    content: Value, // Can be string or array
+    content: Value,
 }
 
-/// Chat Completions API response format (what CLINE expects)
 #[derive(Serialize, Debug)]
 struct ChatCompletionsResponse {
     id: String,
@@ -69,14 +82,13 @@ struct Usage {
     total_tokens: i32,
 }
 
-/// Codex Responses API format (what we send to ChatGPT backend)
 #[derive(Serialize, Debug)]
 struct ResponsesApiRequest {
     model: String,
     instructions: String,
     input: Vec<ResponseItem>,
     tools: Vec<Value>,
-    tool_choice: String,
+    tool_choice: Value,
     parallel_tool_calls: bool,
     reasoning: Option<Value>,
     store: bool,
@@ -101,160 +113,591 @@ enum ContentItem {
     InputText { text: String },
 }
 
-/// Codex auth.json structure
 #[derive(Deserialize, Debug, Clone)]
-struct AuthData {
+struct RawAuthData {
+    auth_mode: Option<String>,
     #[serde(rename = "OPENAI_API_KEY")]
+    openai_api_key: Option<String>,
     api_key: Option<String>,
     tokens: Option<TokenData>,
+    access_token: Option<String>,
+    account_id: Option<String>,
+    refresh_token: Option<String>,
+    last_refresh: Option<String>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[allow(dead_code)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 struct TokenData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id_token: Option<String>,
     access_token: String,
     account_id: String,
     refresh_token: Option<String>,
 }
 
-/// Codex Responses API response format
-#[derive(Deserialize, Debug)]
-struct ResponsesApiResponse {
-    response: Option<ResponseOutput>,
-    id: Option<String>,
+#[derive(Debug, Clone)]
+struct AuthData {
+    auth_mode: Option<String>,
+    api_key: Option<String>,
+    tokens: Option<TokenData>,
+    last_refresh: Option<DateTime<Utc>>,
 }
 
-#[derive(Deserialize, Debug)]
-struct ResponseOutput {
-    content: Option<Vec<ResponseContentItem>>,
-    role: Option<String>,
+#[derive(Debug, Clone)]
+struct Account {
+    name: String,
+    auth_path: String,
+    auth_data: AuthData,
+    last_used: Option<DateTime<Utc>>,
+    quota: Option<QuotaSnapshot>,
+    fail_count: u32,
+    disabled_until: Option<DateTime<Utc>>,
+    last_error: Option<String>,
 }
 
-#[derive(Deserialize, Debug)]
-struct ResponseContentItem {
-    #[serde(rename = "type")]
-    content_type: String,
-    text: Option<String>,
+#[derive(Debug)]
+struct AccountPool {
+    accounts: Vec<Account>,
+    next_index: usize,
+}
+
+#[derive(Debug, Clone)]
+struct AccountLease {
+    index: usize,
+    name: String,
+    auth_data: AuthData,
+}
+
+#[derive(Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    service: &'static str,
+    accounts_loaded: usize,
+    accounts_healthy: usize,
+    next_account: Option<String>,
+    accounts: Vec<AccountHealth>,
+}
+
+#[derive(Serialize)]
+struct AccountHealth {
+    name: String,
+    path: String,
+    healthy: bool,
+    quota: Option<QuotaSnapshot>,
+    fail_count: u32,
+    disabled_until: Option<String>,
+    last_error: Option<String>,
 }
 
 struct ProxyServer {
     client: Client,
-    auth_data: AuthData,
+    account_pool: Arc<Mutex<AccountPool>>,
+    proxy_bearer_token: Option<String>,
 }
 
-impl ProxyServer {
-    async fn new(auth_path: &str) -> Result<Self> {
-        let auth_path = if auth_path.starts_with("~/") {
-            let home = std::env::var("HOME").context("HOME environment variable not set")?;
-            auth_path.replace("~", &home)
-        } else {
-            auth_path.to_string()
-        };
+const TOKEN_REFRESH_THRESHOLD: Duration = Duration::from_secs(300);
+const TOKEN_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const CHATGPT_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
-        let auth_content = tokio::fs::read_to_string(&auth_path)
-            .await
-            .context("Failed to read auth.json")?;
+#[derive(Debug)]
+struct BackendEventSummary {
+    response_id: Option<String>,
+    text: String,
+    deltas: Vec<String>,
+}
 
-        let auth_data: AuthData = serde_json::from_str(&auth_content)
-            .context("Failed to parse auth.json")?;
+#[derive(Debug)]
+struct BackendResponse {
+    model: String,
+    summary: BackendEventSummary,
+}
 
-        // Create client with browser-like configuration
-        let client = Client::builder()
-            .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-            .build()
-            .context("Failed to create HTTP client")?;
+#[derive(Debug)]
+struct AttemptError {
+    retryable: bool,
+    auth_failed: bool,
+    message: String,
+}
 
-        Ok(Self {
-            client,
-            auth_data,
-        })
+#[derive(Deserialize, Debug)]
+struct RefreshTokenResponse {
+    access_token: String,
+    #[serde(default)]
+    id_token: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+}
+
+#[derive(Serialize, Debug, Clone)]
+struct QuotaSnapshot {
+    observed_at: String,
+    source: String,
+    plan_type: Option<String>,
+    active_limit: Option<String>,
+    primary_used_percent: Option<u8>,
+    primary_remaining_percent: Option<u8>,
+    primary_window_minutes: Option<u32>,
+    primary_reset_at: Option<i64>,
+    primary_reset_after_seconds: Option<u32>,
+    secondary_used_percent: Option<u8>,
+    secondary_remaining_percent: Option<u8>,
+    secondary_window_minutes: Option<u32>,
+    secondary_reset_at: Option<i64>,
+    secondary_reset_after_seconds: Option<u32>,
+    credits_has_credits: Option<bool>,
+    credits_unlimited: Option<bool>,
+    credits_balance: Option<String>,
+    raw_limit_name: Option<String>,
+}
+
+impl AttemptError {
+    fn retryable(message: impl Into<String>) -> Self {
+        Self {
+            retryable: true,
+            auth_failed: false,
+            message: message.into(),
+        }
     }
 
-    fn convert_chat_to_responses(&self, chat_req: ChatCompletionsRequest) -> ResponsesApiRequest {
-        // Convert messages to ResponseItems
-        let mut input = Vec::new();
-        
-        for msg in chat_req.messages {
-            // Convert content to string (handle both string and array formats)
-            let content_text = match &msg.content {
-                Value::String(s) => s.clone(),
-                Value::Array(arr) => {
-                    // Extract text from array elements
-                    arr.iter()
-                        .filter_map(|v| {
-                            if let Some(obj) = v.as_object() {
-                                obj.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
-                            } else {
-                                v.as_str().map(|s| s.to_string())
-                            }
-                        })
-                        .collect::<Vec<String>>()
-                        .join(" ")
-                },
-                _ => msg.content.to_string(),
-            };
-            
-            input.push(ResponseItem::Message {
-                id: None,
-                role: msg.role,
-                content: vec![ContentItem::InputText {
-                    text: content_text,
-                }],
+    fn auth_retryable(message: impl Into<String>) -> Self {
+        Self {
+            retryable: true,
+            auth_failed: true,
+            message: message.into(),
+        }
+    }
+
+    fn fatal(message: impl Into<String>) -> Self {
+        Self {
+            retryable: false,
+            auth_failed: false,
+            message: message.into(),
+        }
+    }
+}
+
+impl RawAuthData {
+    fn normalize(self) -> Result<AuthData> {
+        if let Some(tokens) = self.tokens {
+            return Ok(AuthData {
+                auth_mode: self.auth_mode,
+                api_key: self.openai_api_key.or(self.api_key),
+                tokens: Some(tokens),
+                last_refresh: parse_optional_timestamp(self.last_refresh.as_deref())?,
             });
         }
 
-        // Use proper instructions for ChatGPT Responses API
-        let instructions = "You are a helpful AI assistant. Provide clear, accurate, and concise responses to user questions and requests.".to_string();
+        if let (Some(access_token), Some(account_id)) = (self.access_token, self.account_id) {
+            return Ok(AuthData {
+                auth_mode: self.auth_mode,
+                api_key: self.openai_api_key.or(self.api_key),
+                tokens: Some(TokenData {
+                    id_token: None,
+                    access_token,
+                    account_id,
+                    refresh_token: self.refresh_token,
+                }),
+                last_refresh: parse_optional_timestamp(self.last_refresh.as_deref())?,
+            });
+        }
 
-        ResponsesApiRequest {
-            model: chat_req.model,
-            instructions,
-            input,
-            tools: chat_req.tools.unwrap_or_default(),
-            tool_choice: "auto".to_string(),
-            parallel_tool_calls: false,
-            reasoning: None,
-            store: false,
-            stream: true,
-            include: vec![],
+        let api_key = self.openai_api_key.or(self.api_key);
+        if api_key.is_some() {
+            return Ok(AuthData {
+                auth_mode: self.auth_mode,
+                api_key,
+                tokens: None,
+                last_refresh: parse_optional_timestamp(self.last_refresh.as_deref())?,
+            });
+        }
+
+        bail!("auth.json did not contain tokens or an API key");
+    }
+}
+
+impl AccountPool {
+    async fn load(auth_paths: &[String]) -> Result<Self> {
+        let mut accounts = Vec::with_capacity(auth_paths.len());
+        for (index, path) in auth_paths.iter().enumerate() {
+            let resolved_path = expand_home(path)?;
+            let auth_content = tokio::fs::read_to_string(&resolved_path)
+                .await
+                .with_context(|| format!("Failed to read auth file {}", resolved_path))?;
+            let raw_auth: RawAuthData = serde_json::from_str(&auth_content)
+                .with_context(|| format!("Failed to parse auth file {}", resolved_path))?;
+            let auth_data = raw_auth
+                .normalize()
+                .with_context(|| format!("Invalid auth data in {}", resolved_path))?;
+
+            accounts.push(Account {
+                name: format!("account-{}", index + 1),
+                auth_path: resolved_path,
+                auth_data,
+                last_used: None,
+                quota: None,
+                fail_count: 0,
+                disabled_until: None,
+                last_error: None,
+            });
+        }
+
+        if accounts.is_empty() {
+            bail!("At least one auth path is required");
+        }
+
+        Ok(Self {
+            accounts,
+            next_index: 0,
+        })
+    }
+
+    fn lease_next_account(&mut self) -> Result<AccountLease> {
+        let total = self.accounts.len();
+        if total == 0 {
+            bail!("No accounts loaded");
+        }
+
+        let now = chrono::Utc::now();
+        let start = self.next_index;
+
+        for offset in 0..total {
+            let index = (start + offset) % total;
+            let account = &self.accounts[index];
+            let available = account
+                .disabled_until
+                .map(|until| until <= now)
+                .unwrap_or(true);
+            if available {
+                self.next_index = (index + 1) % total;
+                let account = &mut self.accounts[index];
+                account.last_used = Some(now);
+                return Ok(AccountLease {
+                    index,
+                    name: account.name.clone(),
+                    auth_data: account.auth_data.clone(),
+                });
+            }
+        }
+
+        let fallback_index = start % total;
+        self.next_index = (fallback_index + 1) % total;
+        let account = &mut self.accounts[fallback_index];
+        account.last_used = Some(now);
+        Ok(AccountLease {
+            index: fallback_index,
+            name: account.name.clone(),
+            auth_data: account.auth_data.clone(),
+        })
+    }
+
+    fn mark_success(&mut self, index: usize) {
+        if let Some(account) = self.accounts.get_mut(index) {
+            account.fail_count = 0;
+            account.disabled_until = None;
+            account.last_error = None;
         }
     }
 
-
-    async fn proxy_request(&self, chat_req: ChatCompletionsRequest) -> Result<ChatCompletionsResponse> {
-        // For now, return a working response while we implement backend
-        println!("🔄 Processing CLINE request...");
-        println!("🔍 Stream setting: {:?}", chat_req.stream);
-        
-        let chat_res = ChatCompletionsResponse {
-            id: format!("chatcmpl-{}", Uuid::new_v4()),
-            object: "chat.completion".to_string(),
-            created: chrono::Utc::now().timestamp(),
-            model: chat_req.model.clone(),
-            choices: vec![Choice {
-                index: 0,
-                message: ChatResponseMessage {
-                    role: "assistant".to_string(),
-                    content: "I can help you with coding tasks! The proxy connection is working well. What would you like assistance with? (Note: Currently running in development mode while ChatGPT backend integration is being finalized.)".to_string(),
-                },
-                finish_reason: Some("stop".to_string()),
-            }],
-            usage: Some(Usage {
-                prompt_tokens: 50,
-                completion_tokens: 30,
-                total_tokens: 80,
-            }),
-        };
-        
-        Ok(chat_res)
+    fn mark_failure(&mut self, index: usize, message: String) {
+        if let Some(account) = self.accounts.get_mut(index) {
+            account.fail_count = account.fail_count.saturating_add(1);
+            let backoff = failure_backoff(account.fail_count);
+            account.disabled_until = Some(
+                chrono::Utc::now()
+                    + chrono::Duration::from_std(backoff)
+                        .unwrap_or_else(|_| chrono::Duration::seconds(60)),
+            );
+            account.last_error = Some(message);
+        }
     }
-    
-    #[allow(dead_code)]
-    async fn proxy_request_original(&self, chat_req: ChatCompletionsRequest) -> Result<ChatCompletionsResponse> {
-        // Convert to Responses API format
+
+    fn replace_auth_data(&mut self, index: usize, auth_data: AuthData) {
+        if let Some(account) = self.accounts.get_mut(index) {
+            account.auth_data = auth_data;
+            account.fail_count = 0;
+            account.disabled_until = None;
+            account.last_error = None;
+        }
+    }
+
+    fn update_quota(&mut self, index: usize, quota: QuotaSnapshot) {
+        if let Some(account) = self.accounts.get_mut(index) {
+            account.quota = Some(quota);
+        }
+    }
+
+    fn auth_snapshot(&self, index: usize) -> Option<(String, String, AuthData)> {
+        self.accounts.get(index).map(|account| {
+            (
+                account.name.clone(),
+                account.auth_path.clone(),
+                account.auth_data.clone(),
+            )
+        })
+    }
+
+    fn accounts_needing_refresh(&self, threshold: Duration) -> Vec<usize> {
+        let now = Utc::now();
+        self.accounts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, account)| {
+                if account.auth_data.needs_refresh(now, threshold) {
+                    Some(index)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn health(&self) -> HealthResponse {
+        let now = chrono::Utc::now();
+        let accounts = self
+            .accounts
+            .iter()
+            .map(|account| {
+                let healthy = account
+                    .disabled_until
+                    .map(|until| until <= now)
+                    .unwrap_or(true);
+                AccountHealth {
+                    name: account.name.clone(),
+                    path: account.auth_path.clone(),
+                    healthy,
+                    quota: account.quota.clone(),
+                    fail_count: account.fail_count,
+                    disabled_until: account.disabled_until.map(|v| v.to_rfc3339()),
+                    last_error: account.last_error.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let accounts_healthy = accounts.iter().filter(|account| account.healthy).count();
+        let next_account = self
+            .accounts
+            .get(self.next_index)
+            .map(|account| account.name.clone());
+
+        HealthResponse {
+            status: "ok",
+            service: "codex-openai-proxy",
+            accounts_loaded: self.accounts.len(),
+            accounts_healthy,
+            next_account,
+            accounts,
+        }
+    }
+}
+
+impl AuthData {
+    fn needs_refresh(&self, now: DateTime<Utc>, threshold: Duration) -> bool {
+        let Some(tokens) = &self.tokens else {
+            return false;
+        };
+
+        let threshold =
+            chrono::Duration::from_std(threshold).unwrap_or_else(|_| chrono::Duration::minutes(5));
+        let refresh_by = now + threshold;
+
+        let access_expiring = jwt_expiry(&tokens.access_token)
+            .map(|expiry| expiry <= refresh_by)
+            .unwrap_or(false);
+        let id_expiring = tokens
+            .id_token
+            .as_deref()
+            .and_then(jwt_expiry)
+            .map(|expiry| expiry <= refresh_by)
+            .unwrap_or(false);
+
+        access_expiring || id_expiring
+    }
+
+    fn can_refresh(&self) -> bool {
+        self.tokens
+            .as_ref()
+            .and_then(|tokens| tokens.refresh_token.as_ref())
+            .map(|token| !token.is_empty())
+            .unwrap_or(false)
+    }
+
+    fn to_persisted_json(&self) -> Value {
+        match (&self.tokens, &self.api_key) {
+            (Some(tokens), _) => json!({
+                "auth_mode": self.auth_mode.clone().unwrap_or_else(|| "chatgpt".to_string()),
+                "OPENAI_API_KEY": self.api_key,
+                "tokens": tokens,
+                "last_refresh": self.last_refresh.map(|v| v.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)),
+            }),
+            (None, Some(api_key)) => json!({
+                "auth_mode": self.auth_mode,
+                "OPENAI_API_KEY": api_key,
+                "last_refresh": self.last_refresh.map(|v| v.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)),
+            }),
+            (None, None) => json!({}),
+        }
+    }
+}
+
+impl ProxyServer {
+    async fn new(auth_paths: &[String], proxy_bearer_token: Option<String>) -> Result<Self> {
+        let client = Client::builder()
+            .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+            .build()
+            .context("Failed to create HTTP client")?;
+
+        let account_pool = AccountPool::load(auth_paths).await?;
+        let server = Self {
+            client,
+            account_pool: Arc::new(Mutex::new(account_pool)),
+            proxy_bearer_token,
+        };
+        server.spawn_refresh_loop();
+        Ok(server)
+    }
+
+    async fn health(&self) -> HealthResponse {
+        self.account_pool.lock().await.health()
+    }
+
+    async fn proxy_request(
+        &self,
+        chat_req: ChatCompletionsRequest,
+    ) -> Result<ChatCompletionsResponse> {
+        let backend = self.execute_backend_request(chat_req.clone()).await?;
+        Ok(self.translate_to_chat_completion(chat_req.model, backend))
+    }
+
+    async fn proxy_stream_request(&self, chat_req: ChatCompletionsRequest) -> Result<String> {
+        let requested_model = chat_req.model.clone();
+        let backend = self.execute_backend_request(chat_req).await?;
+        Ok(translate_to_chat_sse(&requested_model, backend.summary))
+    }
+
+    async fn execute_backend_request(
+        &self,
+        chat_req: ChatCompletionsRequest,
+    ) -> Result<BackendResponse> {
+        let total_accounts = self.account_pool.lock().await.accounts.len();
+        let mut last_retryable_error = None;
+
+        for _ in 0..total_accounts {
+            let lease = {
+                let mut pool = self.account_pool.lock().await;
+                pool.lease_next_account()?
+            };
+
+            if let Err(error) = self.ensure_account_fresh(&lease).await {
+                eprintln!("Refresh check failed for {}: {}", lease.name, error);
+            }
+            let effective_lease = {
+                let pool = self.account_pool.lock().await;
+                let Some((name, _, auth_data)) = pool.auth_snapshot(lease.index) else {
+                    return Err(anyhow!("Account disappeared before request dispatch"));
+                };
+                AccountLease {
+                    index: lease.index,
+                    name,
+                    auth_data,
+                }
+            };
+            log_request(
+                "POST",
+                "/backend-api/codex/responses",
+                Some(&effective_lease.name),
+            );
+
+            match self.send_backend_request(&effective_lease, &chat_req).await {
+                Ok(response) => {
+                    self.account_pool
+                        .lock()
+                        .await
+                        .mark_success(effective_lease.index);
+                    return Ok(response);
+                }
+                Err(error) if error.auth_failed => {
+                    match self.refresh_account(effective_lease.index, true).await {
+                        Ok(_) => {
+                            let refreshed_lease = {
+                                let pool = self.account_pool.lock().await;
+                                let Some((name, _, auth_data)) =
+                                    pool.auth_snapshot(effective_lease.index)
+                                else {
+                                    return Err(anyhow!("Account disappeared during refresh"));
+                                };
+                                AccountLease {
+                                    index: effective_lease.index,
+                                    name,
+                                    auth_data,
+                                }
+                            };
+                            match self.send_backend_request(&refreshed_lease, &chat_req).await {
+                                Ok(response) => {
+                                    self.account_pool
+                                        .lock()
+                                        .await
+                                        .mark_success(refreshed_lease.index);
+                                    return Ok(response);
+                                }
+                                Err(retry_error) if retry_error.retryable => {
+                                    eprintln!(
+                                        "Retryable upstream failure on {} after refresh: {}",
+                                        refreshed_lease.name, retry_error.message
+                                    );
+                                    self.account_pool.lock().await.mark_failure(
+                                        refreshed_lease.index,
+                                        retry_error.message.clone(),
+                                    );
+                                    last_retryable_error = Some(retry_error.message);
+                                }
+                                Err(retry_error) => return Err(anyhow!(retry_error.message)),
+                            }
+                        }
+                        Err(refresh_error) => {
+                            eprintln!(
+                                "Forced refresh failed for {}: {}",
+                                effective_lease.name, refresh_error
+                            );
+                            self.account_pool
+                                .lock()
+                                .await
+                                .mark_failure(effective_lease.index, error.message.clone());
+                            last_retryable_error = Some(error.message);
+                        }
+                    }
+                }
+                Err(error) if error.retryable => {
+                    eprintln!(
+                        "Retryable upstream failure on {}: {}",
+                        effective_lease.name, error.message
+                    );
+                    self.account_pool
+                        .lock()
+                        .await
+                        .mark_failure(effective_lease.index, error.message.clone());
+                    last_retryable_error = Some(error.message);
+                }
+                Err(error) => {
+                    return Err(anyhow!(error.message));
+                }
+            }
+        }
+
+        Err(anyhow!(
+            "All configured accounts failed. Last error: {}",
+            last_retryable_error.unwrap_or_else(|| "unknown upstream failure".to_string())
+        ))
+    }
+
+    async fn send_backend_request(
+        &self,
+        lease: &AccountLease,
+        chat_req: &ChatCompletionsRequest,
+    ) -> std::result::Result<BackendResponse, AttemptError> {
         let responses_req = self.convert_chat_to_responses(chat_req);
-        
-        // Build request to ChatGPT backend with browser-like headers
-        let mut request_builder = self.client
+        let mut request_builder = self
+            .client
             .post("https://chatgpt.com/backend-api/codex/responses")
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
@@ -269,256 +712,627 @@ impl ProxyServer {
             .header("Pragma", "no-cache")
             .header("DNT", "1")
             .header("OpenAI-Beta", "responses=experimental")
-            .header("originator", "codex_cli_rs");
+            .header("originator", "codex_cli_rs")
+            .header("session_id", Uuid::new_v4().to_string());
 
-        // Add authentication
-        if let Some(tokens) = &self.auth_data.tokens {
-            request_builder = request_builder.header("Authorization", format!("Bearer {}", tokens.access_token));
-            request_builder = request_builder.header("chatgpt-account-id", &tokens.account_id);
-        } else if let Some(api_key) = &self.auth_data.api_key {
-            request_builder = request_builder.header("Authorization", format!("Bearer {}", api_key));
+        if let Some(tokens) = &lease.auth_data.tokens {
+            request_builder = request_builder
+                .header("Authorization", format!("Bearer {}", tokens.access_token))
+                .header("chatgpt-account-id", &tokens.account_id);
+        } else if let Some(api_key) = &lease.auth_data.api_key {
+            request_builder =
+                request_builder.header("Authorization", format!("Bearer {}", api_key));
+        } else {
+            return Err(AttemptError::fatal(format!(
+                "{} does not have usable authentication data",
+                lease.name
+            )));
         }
 
-        // Add session ID
-        let session_id = Uuid::new_v4();
-        request_builder = request_builder.header("session_id", session_id.to_string());
-
-        // Send request
         let response = request_builder
             .json(&responses_req)
             .send()
             .await
-            .context("Failed to send request to ChatGPT backend")?;
+            .map_err(|error| AttemptError::retryable(format!("Network error: {}", error)))?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            
-            // Instead of returning error, create a valid response with error message
-            let error_message = "Hello! I'm responding from the proxy. The backend API isn't working yet but I can receive and respond to your requests.".to_string();
-            
-            let chat_res = ChatCompletionsResponse {
-                id: format!("chatcmpl-{}", Uuid::new_v4()),
-                object: "chat.completion".to_string(),
-                created: chrono::Utc::now().timestamp(),
-                model: responses_req.model.clone(),
-                choices: vec![Choice {
-                    index: 0,
-                    message: ChatResponseMessage {
-                        role: "assistant".to_string(),
-                        content: error_message,
-                    },
-                    finish_reason: Some("stop".to_string()),
-                }],
-                usage: Some(Usage {
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    total_tokens: 0,
-                }),
-            };
-            
-            return Ok(chat_res);
+        let status = response.status();
+        let quota = quota_from_headers(response.headers());
+        let body = response.text().await.map_err(|error| {
+            AttemptError::retryable(format!("Failed to read upstream response: {}", error))
+        })?;
+
+        if let Some(quota) = quota {
+            self.account_pool
+                .lock()
+                .await
+                .update_quota(lease.index, quota);
         }
 
-        // Handle streaming response
-        let mut response_content = String::new();
-        let response_text = response.text().await?;
-        let lines: Vec<&str> = response_text.lines().collect();
-        
-        for line in lines {
-            if line.starts_with("data: ") {
-                let json_data = &line[6..]; // Remove "data: " prefix
-                if json_data == "[DONE]" {
-                    break;
+        if !status.is_success() {
+            let summary = summarize_body(&body);
+            if status.as_u16() == 401 || status.as_u16() == 403 {
+                return Err(AttemptError::auth_retryable(format!(
+                    "Upstream status {} for {}: {}",
+                    status, lease.name, summary
+                )));
+            }
+            if status.is_server_error() || status.as_u16() == 429 {
+                return Err(AttemptError::retryable(format!(
+                    "Upstream status {} for {}: {}",
+                    status, lease.name, summary
+                )));
+            }
+
+            return Err(AttemptError::fatal(format!(
+                "Upstream status {}: {}",
+                status, summary
+            )));
+        }
+
+        let summary = parse_responses_event_stream(&body).map_err(|error| {
+            AttemptError::fatal(format!("Failed to parse upstream SSE: {}", error))
+        })?;
+
+        Ok(BackendResponse {
+            model: chat_req.model.clone(),
+            summary,
+        })
+    }
+
+    fn spawn_refresh_loop(&self) {
+        let proxy = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(TOKEN_REFRESH_INTERVAL);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                if let Err(error) = proxy.refresh_expiring_accounts().await {
+                    eprintln!("Background refresh loop error: {}", error);
                 }
-                
-                if let Ok(event) = serde_json::from_str::<serde_json::Value>(json_data) {
-                    if let Some(event_type) = event.get("type").and_then(|v| v.as_str()) {
-                        match event_type {
-                            "response.output_text.delta" => {
-                                if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
-                                    response_content.push_str(delta);
-                                }
-                            }
-                            "response.output_item.done" => {
-                                if let Some(item) = event.get("item") {
-                                    if let Some(content_arr) = item.get("content").and_then(|v| v.as_array()) {
-                                        for content_item in content_arr {
-                                            if let Some(text) = content_item.get("text").and_then(|v| v.as_str()) {
-                                                response_content.push_str(text);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {} // Ignore other event types
-                        }
-                    }
-                }
+            }
+        });
+    }
+
+    async fn refresh_expiring_accounts(&self) -> Result<()> {
+        let indices = {
+            let pool = self.account_pool.lock().await;
+            pool.accounts_needing_refresh(TOKEN_REFRESH_THRESHOLD)
+        };
+
+        for index in indices {
+            if let Err(error) = self.refresh_account(index, false).await {
+                eprintln!(
+                    "Scheduled refresh failed for account {}: {}",
+                    index + 1,
+                    error
+                );
             }
         }
 
-        // If no content was collected, use a default message
-        if response_content.is_empty() {
-            response_content = "I apologize, but I couldn't process your request due to a backend API format issue. The proxy is receiving your request correctly but needs format refinement.".to_string();
+        Ok(())
+    }
+
+    async fn ensure_account_fresh(&self, lease: &AccountLease) -> Result<()> {
+        if lease
+            .auth_data
+            .needs_refresh(Utc::now(), TOKEN_REFRESH_THRESHOLD)
+        {
+            self.refresh_account(lease.index, false).await?;
+        }
+        Ok(())
+    }
+
+    async fn refresh_account(&self, index: usize, force: bool) -> Result<()> {
+        let (name, path, auth_data) = {
+            let pool = self.account_pool.lock().await;
+            pool.auth_snapshot(index)
+                .ok_or_else(|| anyhow!("Unknown account index {}", index))?
+        };
+
+        if !auth_data.can_refresh() {
+            return Ok(());
+        }
+        if !force && !auth_data.needs_refresh(Utc::now(), TOKEN_REFRESH_THRESHOLD) {
+            return Ok(());
         }
 
-        // Create Chat Completions response
-        let chat_res = ChatCompletionsResponse {
-            id: format!("chatcmpl-{}", Uuid::new_v4()),
+        let refreshed_auth = self.perform_refresh(&name, auth_data).await?;
+        persist_auth_file(&path, &refreshed_auth)
+            .await
+            .with_context(|| format!("Failed to persist refreshed auth for {}", name))?;
+
+        self.account_pool
+            .lock()
+            .await
+            .replace_auth_data(index, refreshed_auth);
+        println!("Refreshed credentials for {}", name);
+        Ok(())
+    }
+
+    async fn perform_refresh(&self, account_name: &str, auth_data: AuthData) -> Result<AuthData> {
+        let tokens = auth_data
+            .tokens
+            .clone()
+            .ok_or_else(|| anyhow!("{} has no token-based auth to refresh", account_name))?;
+        let refresh_token = tokens
+            .refresh_token
+            .clone()
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| anyhow!("{} has no refresh token", account_name))?;
+
+        let response = self
+            .client
+            .post("https://auth.openai.com/oauth/token")
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", CHATGPT_CLIENT_ID),
+                ("refresh_token", refresh_token.as_str()),
+                ("scope", "openid profile email offline_access"),
+            ])
+            .send()
+            .await
+            .with_context(|| format!("Refresh request failed for {}", account_name))?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .context("Failed to read refresh response")?;
+        if !status.is_success() {
+            bail!(
+                "Refresh failed for {} with status {}: {}",
+                account_name,
+                status,
+                summarize_body(&body)
+            );
+        }
+
+        let refresh: RefreshTokenResponse = serde_json::from_str(&body)
+            .with_context(|| format!("Invalid refresh response for {}", account_name))?;
+
+        Ok(AuthData {
+            auth_mode: auth_data.auth_mode,
+            api_key: auth_data.api_key,
+            tokens: Some(TokenData {
+                id_token: refresh.id_token.or(tokens.id_token),
+                access_token: refresh.access_token,
+                account_id: tokens.account_id,
+                refresh_token: refresh.refresh_token.or(tokens.refresh_token),
+            }),
+            last_refresh: Some(Utc::now()),
+        })
+    }
+
+    fn convert_chat_to_responses(&self, chat_req: &ChatCompletionsRequest) -> ResponsesApiRequest {
+        let mut input = Vec::new();
+
+        for msg in &chat_req.messages {
+            input.push(ResponseItem::Message {
+                id: None,
+                role: msg.role.clone(),
+                content: vec![ContentItem::InputText {
+                    text: message_content_to_text(&msg.content),
+                }],
+            });
+        }
+
+        ResponsesApiRequest {
+            model: chat_req.model.clone(),
+            instructions: "You are a helpful AI assistant. Provide clear, accurate, and concise responses to user questions and requests.".to_string(),
+            input,
+            tools: chat_req.tools.clone().unwrap_or_default(),
+            tool_choice: chat_req
+                .tool_choice
+                .clone()
+                .unwrap_or_else(|| Value::String("auto".to_string())),
+            parallel_tool_calls: false,
+            reasoning: None,
+            store: false,
+            stream: true,
+            include: vec![],
+        }
+    }
+
+    fn translate_to_chat_completion(
+        &self,
+        requested_model: String,
+        backend: BackendResponse,
+    ) -> ChatCompletionsResponse {
+        let content = if backend.summary.text.is_empty() {
+            "Upstream returned no text content".to_string()
+        } else {
+            backend.summary.text
+        };
+
+        ChatCompletionsResponse {
+            id: backend
+                .summary
+                .response_id
+                .unwrap_or_else(|| format!("chatcmpl-{}", Uuid::new_v4())),
             object: "chat.completion".to_string(),
             created: chrono::Utc::now().timestamp(),
-            model: responses_req.model.clone(),
+            model: backend.model.if_empty_then(requested_model),
             choices: vec![Choice {
                 index: 0,
                 message: ChatResponseMessage {
                     role: "assistant".to_string(),
-                    content: response_content,
+                    content,
                 },
                 finish_reason: Some("stop".to_string()),
             }],
-            usage: Some(Usage {
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                total_tokens: 0,
-            }),
-        };
-        
-        Ok(chat_res)
-    }
-}
-
-// Enhanced logging function
-fn log_request(method: &warp::http::Method, path: &str, headers: &warp::http::HeaderMap) {
-    let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3f UTC");
-    
-    println!("\n🔍 === INTERCEPTED REQUEST ===");
-    println!("⏰ Timestamp: {}", timestamp);
-    println!("📥 Method: {}", method);
-    println!("📍 Path: {}", path);
-    
-    // Log all headers with special attention to problematic ones
-    println!("\n📋 Headers ({} total):", headers.len());
-    for (name, value) in headers.iter() {
-        let header_name = name.as_str().to_lowercase();
-        let value_str = match value.to_str() {
-            Ok(v) => v,
-            Err(_) => "[INVALID UTF-8]"
-        };
-        
-        // Highlight potential CLINE-specific headers
-        if header_name.contains("user-agent") || header_name.contains("client") || header_name.contains("cline") {
-            println!("  🎯 {}: {}", name, value_str);
-        } else if header_name == "authorization" {
-            println!("  🔐 {}: {}***", name, &value_str[..std::cmp::min(20, value_str.len())]);
-        } else {
-            println!("  📄 {}: {}", name, value_str);
+            usage: None,
         }
     }
-    
-    // Check for VS Code specific patterns
-    let user_agent = headers.get("user-agent")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("none");
-    
-    if user_agent.to_lowercase().contains("vscode") {
-        println!("🎯 DETECTED: VS Code client!");
-    }
-    if user_agent.to_lowercase().contains("cline") {
-        println!("🎯 DETECTED: CLINE extension!");
-    }
-    
-    println!("🔍 === END INTERCEPT ===\n");
 }
 
-// Removed catch_all_handler - using inline closure to avoid body consumption conflicts
+trait StringFallback {
+    fn if_empty_then(self, fallback: String) -> String;
+}
+
+impl StringFallback for String {
+    fn if_empty_then(self, fallback: String) -> String {
+        if self.is_empty() {
+            fallback
+        } else {
+            self
+        }
+    }
+}
+
+fn failure_backoff(fail_count: u32) -> Duration {
+    let seconds = match fail_count {
+        0 | 1 => 15,
+        2 => 30,
+        3 => 60,
+        _ => 120,
+    };
+    Duration::from_secs(seconds)
+}
+
+fn parse_optional_timestamp(value: Option<&str>) -> Result<Option<DateTime<Utc>>> {
+    value
+        .map(|timestamp| {
+            DateTime::parse_from_rfc3339(timestamp)
+                .map(|v| v.with_timezone(&Utc))
+                .with_context(|| format!("invalid timestamp {}", timestamp))
+        })
+        .transpose()
+}
+
+fn expand_home(path: &str) -> Result<String> {
+    if path.starts_with("~/") {
+        let home = std::env::var("HOME").context("HOME environment variable not set")?;
+        Ok(path.replacen('~', &home, 1))
+    } else {
+        Ok(path.to_string())
+    }
+}
+
+fn jwt_expiry(token: &str) -> Option<DateTime<Utc>> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims: Value = serde_json::from_slice(&decoded).ok()?;
+    let exp = claims.get("exp")?.as_i64()?;
+    DateTime::<Utc>::from_timestamp(exp, 0)
+}
+
+async fn persist_auth_file(path: &str, auth_data: &AuthData) -> Result<()> {
+    let json = serde_json::to_string_pretty(&auth_data.to_persisted_json())
+        .context("Failed to serialize refreshed auth")?;
+    tokio::fs::write(path, format!("{}\n", json))
+        .await
+        .with_context(|| format!("Failed to write {}", path))?;
+    Ok(())
+}
+
+fn quota_from_headers(headers: &reqwest::header::HeaderMap) -> Option<QuotaSnapshot> {
+    let has_codex_headers = headers
+        .keys()
+        .any(|name| name.as_str().starts_with("x-codex-"));
+    if !has_codex_headers {
+        return None;
+    }
+
+    let source = if header_str(headers, "x-codex-bengalfox-limit-name").is_some() {
+        "x-codex-bengalfox-*"
+    } else {
+        "x-codex-*"
+    };
+
+    let primary_used = header_u8(headers, "x-codex-primary-used-percent");
+    let secondary_used = header_u8(headers, "x-codex-secondary-used-percent");
+
+    Some(QuotaSnapshot {
+        observed_at: Utc::now().to_rfc3339(),
+        source: source.to_string(),
+        plan_type: header_string(headers, "x-codex-plan-type"),
+        active_limit: header_string(headers, "x-codex-active-limit"),
+        primary_used_percent: primary_used,
+        primary_remaining_percent: primary_used.map(|v| 100u8.saturating_sub(v)),
+        primary_window_minutes: header_u32(headers, "x-codex-primary-window-minutes"),
+        primary_reset_at: header_i64(headers, "x-codex-primary-reset-at"),
+        primary_reset_after_seconds: header_u32(headers, "x-codex-primary-reset-after-seconds"),
+        secondary_used_percent: secondary_used,
+        secondary_remaining_percent: secondary_used.map(|v| 100u8.saturating_sub(v)),
+        secondary_window_minutes: header_u32(headers, "x-codex-secondary-window-minutes"),
+        secondary_reset_at: header_i64(headers, "x-codex-secondary-reset-at"),
+        secondary_reset_after_seconds: header_u32(headers, "x-codex-secondary-reset-after-seconds"),
+        credits_has_credits: header_bool(headers, "x-codex-credits-has-credits"),
+        credits_unlimited: header_bool(headers, "x-codex-credits-unlimited"),
+        credits_balance: header_string(headers, "x-codex-credits-balance"),
+        raw_limit_name: header_string(headers, "x-codex-bengalfox-limit-name"),
+    })
+}
+
+fn header_str<'a>(headers: &'a reqwest::header::HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+fn header_string(headers: &reqwest::header::HeaderMap, name: &str) -> Option<String> {
+    header_str(headers, name)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+}
+
+fn header_u8(headers: &reqwest::header::HeaderMap, name: &str) -> Option<u8> {
+    header_str(headers, name)?.trim().parse().ok()
+}
+
+fn header_u32(headers: &reqwest::header::HeaderMap, name: &str) -> Option<u32> {
+    header_str(headers, name)?.trim().parse().ok()
+}
+
+fn header_i64(headers: &reqwest::header::HeaderMap, name: &str) -> Option<i64> {
+    header_str(headers, name)?.trim().parse().ok()
+}
+
+fn header_bool(headers: &reqwest::header::HeaderMap, name: &str) -> Option<bool> {
+    match header_str(headers, name)?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn message_content_to_text(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(arr) => arr
+            .iter()
+            .filter_map(|value| {
+                value
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .or_else(|| value.as_str().map(ToString::to_string))
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => content.to_string(),
+    }
+}
+
+fn parse_responses_event_stream(stream: &str) -> Result<BackendEventSummary> {
+    let mut response_id = None;
+    let mut deltas = Vec::new();
+    let mut final_text_parts = Vec::new();
+
+    for line in stream.lines() {
+        if !line.starts_with("data: ") {
+            continue;
+        }
+
+        let json_payload = &line[6..];
+        if json_payload == "[DONE]" {
+            break;
+        }
+
+        let event: Value = serde_json::from_str(json_payload).with_context(|| {
+            format!(
+                "invalid SSE event payload: {}",
+                summarize_body(json_payload)
+            )
+        })?;
+
+        if response_id.is_none() {
+            response_id = event
+                .get("response")
+                .and_then(|response| response.get("id"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .or_else(|| {
+                    event
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                });
+        }
+
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.output_text.delta") => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    deltas.push(delta.to_string());
+                }
+            }
+            Some("response.output_item.done") => {
+                if deltas.is_empty() {
+                    if let Some(content) = event
+                        .get("item")
+                        .and_then(|item| item.get("content"))
+                        .and_then(Value::as_array)
+                    {
+                        for part in content {
+                            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                                final_text_parts.push(text.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            Some("response.completed") => {
+                if deltas.is_empty() {
+                    if let Some(output) = event
+                        .get("response")
+                        .and_then(|response| response.get("output"))
+                        .and_then(Value::as_array)
+                    {
+                        for item in output {
+                            if let Some(content) = item.get("content").and_then(Value::as_array) {
+                                for part in content {
+                                    if let Some(text) = part.get("text").and_then(Value::as_str) {
+                                        final_text_parts.push(text.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let text = if deltas.is_empty() {
+        final_text_parts.join("")
+    } else {
+        deltas.join("")
+    };
+
+    Ok(BackendEventSummary {
+        response_id,
+        text,
+        deltas,
+    })
+}
+
+fn translate_to_chat_sse(requested_model: &str, summary: BackendEventSummary) -> String {
+    let chunk_id = summary
+        .response_id
+        .unwrap_or_else(|| format!("chatcmpl-{}", Uuid::new_v4()));
+    let created = chrono::Utc::now().timestamp();
+    let mut chunks = Vec::new();
+
+    chunks.push(format!(
+        "data: {{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\"}},\"finish_reason\":null}}]}}\n\n",
+        chunk_id, created, requested_model
+    ));
+
+    if summary.deltas.is_empty() {
+        if !summary.text.is_empty() {
+            chunks.push(format!(
+                "data: {{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{}}},\"finish_reason\":null}}]}}\n\n",
+                chunk_id,
+                created,
+                requested_model,
+                serde_json::to_string(&summary.text).unwrap_or_else(|_| "\"\"".to_string())
+            ));
+        }
+    } else {
+        for delta in summary.deltas {
+            chunks.push(format!(
+                "data: {{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{}}},\"finish_reason\":null}}]}}\n\n",
+                chunk_id,
+                created,
+                requested_model,
+                serde_json::to_string(&delta).unwrap_or_else(|_| "\"\"".to_string())
+            ));
+        }
+    }
+
+    chunks.push(format!(
+        "data: {{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n",
+        chunk_id, created, requested_model
+    ));
+    chunks.push("data: [DONE]\n\n".to_string());
+
+    chunks.join("")
+}
+
+fn summarize_body(body: &str) -> String {
+    body.chars()
+        .take(240)
+        .collect::<String>()
+        .replace('\n', " ")
+}
+
+fn log_request(method: &str, path: &str, account: Option<&str>) {
+    let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3f UTC");
+    match account {
+        Some(account_name) => println!("[{}] {} {} via {}", timestamp, method, path, account_name),
+        None => println!("[{}] {} {}", timestamp, method, path),
+    }
+}
+
+fn extract_bearer_token(headers: &warp::http::HeaderMap) -> Option<&str> {
+    let value = headers.get("authorization")?.to_str().ok()?;
+    value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+}
+
+fn proxy_auth_reply() -> warp::reply::Response {
+    warp::reply::with_status("Unauthorized", warp::http::StatusCode::UNAUTHORIZED).into_response()
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
 
+    let proxy = ProxyServer::new(&args.auth_paths, args.proxy_bearer_token.clone()).await?;
+    let health = proxy.health().await;
+
     println!("Initializing Codex OpenAI Proxy...");
-    
-    let proxy = ProxyServer::new(&args.auth_path).await?;
-    println!("✓ Loaded authentication from {}", args.auth_path);
+    println!("Loaded {} auth file(s)", health.accounts_loaded);
+    println!("Listening on http://0.0.0.0:{}", args.port);
+    println!(
+        "Proxy bearer auth: {}",
+        if args.proxy_bearer_token.is_some() {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
 
-    // Health check endpoint (removed unused variable warning)
-    let _health = warp::path("health")
-        .and(warp::get())
-        .map(|| {
-            println!("💚 Health check requested");
-            warp::reply::json(&json!({
-                "status": "ok",
-                "service": "codex-openai-proxy"
-            }))
-        });
-
-    // Multiple endpoints for CLINE compatibility
     let proxy_filter = warp::any().map(move || proxy.clone());
-    
-    let _chat_completions_v1 = warp::path!("v1" / "chat" / "completions")
-        .and(warp::post())
-        .and(warp::header::headers_cloned())
-        .and(warp::body::json())
-        .and(proxy_filter.clone())
-        .and_then(handle_chat_completions);
-        
-    let _chat_completions_direct = warp::path("chat")
-        .and(warp::path("completions"))
-        .and(warp::path::end())
-        .and(warp::post())
-        .and(warp::header::headers_cloned())
-        .and(warp::body::json())
-        .and(proxy_filter.clone())
-        .and_then(handle_chat_completions);
 
-    // Models endpoints
-    let _models_v1 = warp::path!("v1" / "models")
-        .and(warp::get())
-        .and(warp::header::headers_cloned())
-        .and_then(handle_models);
-        
-    let _models_direct = warp::path("models")
-        .and(warp::get())
-        .and(warp::header::headers_cloned())
-        .and_then(handle_models);
-
-    // CORS headers - allow all headers to fix CLINE issues
     let cors = warp::cors()
         .allow_any_origin()
-        .allow_headers(vec!["authorization", "content-type", "accept", "accept-encoding", "x-stainless-arch", "x-stainless-lang", "x-stainless-os", "x-stainless-package-version", "x-stainless-retry-count", "x-stainless-runtime", "x-stainless-runtime-version", "x-stainless-timeout"])
+        .allow_headers(vec![
+            "authorization",
+            "content-type",
+            "accept",
+            "accept-encoding",
+            "x-stainless-arch",
+            "x-stainless-lang",
+            "x-stainless-os",
+            "x-stainless-package-version",
+            "x-stainless-retry-count",
+            "x-stainless-runtime",
+            "x-stainless-runtime-version",
+            "x-stainless-timeout",
+        ])
         .allow_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"]);
 
-    // BULLETPROOF SOLUTION - Single universal handler (removed old catch_all)
-    let universal_handler = warp::any()
+    let routes = warp::any()
         .and(warp::method())
         .and(warp::path::full())
         .and(warp::header::headers_cloned())
         .and(warp::body::bytes())
-        .and(proxy_filter.clone())
-        .and_then(universal_request_handler);
-
-    let routes = universal_handler
+        .and(proxy_filter)
+        .and_then(universal_request_handler)
         .with(cors)
         .with(warp::log("codex_proxy"));
 
-    println!("🚀 Codex OpenAI Proxy listening on http://0.0.0.0:{}", args.port);
-    println!("   Health check: http://localhost:{}/health", args.port);
-    println!("   Chat endpoint: http://localhost:{}/v1/chat/completions", args.port);
-    println!("\n   Configure CLINE with:");
-    println!("   Base URL: http://localhost:{}", args.port);
-    println!("   Model: gpt-5");
-    println!("   API Key: (any value)");
-
-    warp::serve(routes)
-        .run(([0, 0, 0, 0], args.port))
-        .await;
-
+    warp::serve(routes).run(([0, 0, 0, 0], args.port)).await;
     Ok(())
 }
 
-// Universal handler that routes based on path and method
 async fn universal_request_handler(
     method: warp::http::Method,
     path: warp::path::FullPath,
@@ -527,246 +1341,264 @@ async fn universal_request_handler(
     proxy: ProxyServer,
 ) -> Result<impl warp::Reply, warp::Rejection> {
     let path_str = path.as_str();
-    
-    log_request(&method, path_str, &headers);
-    
+    log_request(method.as_str(), path_str, None);
+
+    if let Some(expected_token) = &proxy.proxy_bearer_token {
+        let provided_token = extract_bearer_token(&headers);
+        if provided_token != Some(expected_token.as_str()) {
+            return Ok(proxy_auth_reply());
+        }
+    }
+
     match (method.as_str(), path_str) {
-        ("GET", "/health") => {
-            println!("💚 Health check requested");
-            Ok(warp::reply::json(&json!({
-                "status": "ok",
-                "service": "codex-openai-proxy"
-            })).into_response())
-        },
-        ("GET", "/models") | ("GET", "/v1/models") => {
-            println!("📋 === MATCHED MODELS REQUEST ===");
-            println!("📋 === END MATCHED ===\n");
-            
-            let models_response = json!({
-                "object": "list",
-                "data": [
-                    {
-                        "id": "gpt-4",
-                        "object": "model",
-                        "created": 1687882411,
-                        "owned_by": "openai"
-                    },
-                    {
-                        "id": "gpt-5",
-                        "object": "model", 
-                        "created": 1687882411,
-                        "owned_by": "openai"
-                    }
-                ]
-            });
-            
-            Ok(warp::reply::json(&models_response).into_response())
-        },
+        ("GET", "/health") => Ok(warp::reply::json(&proxy.health().await).into_response()),
+        ("GET", "/models") | ("GET", "/v1/models") => Ok(warp::reply::json(&json!({
+            "object": "list",
+            "data": [
+                {
+                    "id": "gpt-4",
+                    "object": "model",
+                    "created": 1687882411,
+                    "owned_by": "openai"
+                },
+                {
+                    "id": "gpt-5",
+                    "object": "model",
+                    "created": 1687882411,
+                    "owned_by": "openai"
+                }
+            ]
+        }))
+        .into_response()),
         ("POST", "/chat/completions") | ("POST", "/v1/chat/completions") => {
-            println!("🔥 === MATCHED CHAT COMPLETIONS ===");
-            
-            // LOG EXACT CLINE REQUEST FOR CURL REPLICATION
-            println!("\n📋 === CLINE REQUEST DETAILS FOR CURL ===");
-            println!("Method: POST");
-            println!("Path: {}", path_str);
-            println!("Body size: {} bytes", body.len());
-            
-            // Log all headers in curl format
-            println!("\nHeaders for curl:");
-            for (name, value) in headers.iter() {
-                if let Ok(value_str) = value.to_str() {
-                    if name.as_str().to_lowercase() == "authorization" {
-                        println!("  -H \"{}: {}***\"", name, &value_str[..std::cmp::min(20, value_str.len())]);
-                    } else if name.as_str().to_lowercase().starts_with("x-forwarded") {
-                        println!("  # Skip: -H \"{}: {}\"", name, value_str);
-                    } else {
-                        println!("  -H \"{}: {}\"", name, value_str);
-                    }
-                }
-            }
-            
-            // Log body (truncated for readability)
-            println!("\nBody (first 1000 chars):");
-            if let Ok(body_str) = std::str::from_utf8(&body) {
-                let truncated = if body_str.len() > 1000 {
-                    format!("{}... [TRUNCATED]", &body_str[..1000])
-                } else {
-                    body_str.to_string()
-                };
-                println!("{}", truncated);
-                
-                // Generate curl command
-                println!("\n🚀 CURL COMMAND TO REPLICATE:");
-                println!("curl -X POST http://localhost:8888{} \\", path_str);
-                for (name, value) in headers.iter() {
-                    if let Ok(value_str) = value.to_str() {
-                        if !name.as_str().to_lowercase().starts_with("x-forwarded") 
-                           && name.as_str().to_lowercase() != "host" {
-                            if name.as_str().to_lowercase() == "authorization" {
-                                println!("  -H \"{}: test-key\" \\", name);
-                            } else {
-                                println!("  -H \"{}: {}\" \\", name, value_str);
-                            }
-                        }
-                    }
-                }
-                println!("  -d '{}'", body_str.chars().take(500).collect::<String>());
-            }
-            println!("📋 === END CLINE REQUEST DETAILS ===\n");
-            
-            // Parse JSON from bytes
             let chat_req: ChatCompletionsRequest = match serde_json::from_slice(&body) {
                 Ok(req) => req,
-                Err(e) => {
-                    println!("❌ JSON parse error: {}", e);
+                Err(error) => {
+                    eprintln!("Invalid JSON body: {}", error);
                     return Ok(warp::reply::with_status(
                         "Invalid JSON",
-                        warp::http::StatusCode::BAD_REQUEST
-                    ).into_response());
+                        warp::http::StatusCode::BAD_REQUEST,
+                    )
+                    .into_response());
                 }
             };
-            
-            println!("   Model: {}", chat_req.model);
-            println!("   Messages: {} items", chat_req.messages.len());
-            for (i, msg) in chat_req.messages.iter().enumerate() {
-                let content_preview = match &msg.content {
-                    Value::String(s) => s.chars().take(50).collect::<String>(),
-                    Value::Array(arr) => format!("[array with {} items]", arr.len()),
-                    _ => format!("[{}]", msg.content.to_string().chars().take(50).collect::<String>()),
-                };
-                println!("   [{}] {}: {}", i, msg.role, content_preview);
-            }
-            println!("🔥 === END MATCHED ===\n");
-            
-            // Check if streaming is requested
+
             if chat_req.stream.unwrap_or(false) {
-                println!("🔄 STREAMING: CLINE requested streaming response, implementing SSE format");
-                
-                // Generate contextual response based on user messages
-                let message = improved_response::generate_contextual_response(&chat_req.messages);
-                println!("📝 Generated contextual response: {}", &message[..std::cmp::min(100, message.len())]);
-                
-                let chunk_id = "chatcmpl-streaming-12345";
-                let model = chat_req.model.clone();
-                
-                let sse_chunks = vec![
-                    // First chunk with role
-                    format!("data: {{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\"}},\"finish_reason\":null}}]}}\n\n", 
-                            chunk_id, chrono::Utc::now().timestamp(), model),
-                    // Content chunk
-                    format!("data: {{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{}\"}},\"finish_reason\":null}}]}}\n\n", 
-                            chunk_id, chrono::Utc::now().timestamp(), model, message),
-                    // Final chunk
-                    format!("data: {{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n", 
-                            chunk_id, chrono::Utc::now().timestamp(), model),
-                    // End marker
-                    "data: [DONE]\n\n".to_string(),
-                ];
-                
-                let sse_response = sse_chunks.join("");
-                let reply = warp::reply::with_header(sse_response, "content-type", "text/event-stream");
-                let reply = warp::reply::with_header(reply, "cache-control", "no-cache");
-                let reply = warp::reply::with_header(reply, "connection", "keep-alive");
-                let reply = warp::reply::with_header(reply, "access-control-allow-origin", "*");
-                Ok(reply.into_response())
-            } else {
-                match proxy.proxy_request(chat_req).await {
-                    Ok(response) => {
-                        let reply = warp::reply::json(&response);
-                        let reply = warp::reply::with_header(reply, "content-type", "application/json");
-                        let reply = warp::reply::with_header(reply, "access-control-allow-origin", "*");
+                match proxy.proxy_stream_request(chat_req).await {
+                    Ok(sse_response) => {
+                        let reply = warp::reply::with_header(
+                            sse_response,
+                            "content-type",
+                            "text/event-stream",
+                        );
+                        let reply = warp::reply::with_header(reply, "cache-control", "no-cache");
+                        let reply = warp::reply::with_header(reply, "connection", "keep-alive");
+                        let reply =
+                            warp::reply::with_header(reply, "access-control-allow-origin", "*");
                         Ok(reply.into_response())
-                    },
-                    Err(e) => {
-                        eprintln!("Proxy error: {:#}", e);
-                        let reply = warp::reply::json(&json!({
+                    }
+                    Err(error) => {
+                        eprintln!("Proxy error: {:#}", error);
+                        Ok(warp::reply::json(&json!({
                             "error": {
-                                "message": format!("Proxy error: {}", e),
+                                "message": format!("Proxy error: {}", error),
                                 "type": "proxy_error",
                                 "code": "internal_error"
                             }
-                        }));
-                        let reply = warp::reply::with_header(reply, "content-type", "application/json");
-                        let reply = warp::reply::with_header(reply, "access-control-allow-origin", "*");
-                        Ok(reply.into_response())
+                        }))
+                        .into_response())
+                    }
+                }
+            } else {
+                match proxy.proxy_request(chat_req).await {
+                    Ok(response) => Ok(warp::reply::json(&response).into_response()),
+                    Err(error) => {
+                        eprintln!("Proxy error: {:#}", error);
+                        Ok(warp::reply::json(&json!({
+                            "error": {
+                                "message": format!("Proxy error: {}", error),
+                                "type": "proxy_error",
+                                "code": "internal_error"
+                            }
+                        }))
+                        .into_response())
                     }
                 }
             }
-        },
-        _ => {
-            println!("❌ UNMATCHED: {} {}", method, path_str);
-            Ok(warp::reply::with_status(
-                "Not found",
-                warp::http::StatusCode::NOT_FOUND
-            ).into_response())
         }
+        _ => Ok(
+            warp::reply::with_status("Not found", warp::http::StatusCode::NOT_FOUND)
+                .into_response(),
+        ),
     }
 }
 
-async fn handle_models(
-    headers: warp::http::HeaderMap,
-) -> Result<impl warp::Reply, warp::Rejection> {
-    log_request(&warp::http::Method::GET, "/models", &headers);
-    
-    println!("📋 === MATCHED MODELS REQUEST ===");
-    println!("📋 === END MATCHED ===\n");
-    
-    // Return a simple models list for CLINE
-    let models_response = json!({
-        "object": "list",
-        "data": [
-            {
-                "id": "gpt-4",
-                "object": "model",
-                "created": 1687882411,
-                "owned_by": "openai"
-            },
-            {
-                "id": "gpt-5",
-                "object": "model", 
-                "created": 1687882411,
-                "owned_by": "openai"
-            }
-        ]
-    });
-    
-    Ok(warp::reply::json(&models_response))
-}
-
-async fn handle_chat_completions(
-    headers: warp::http::HeaderMap,
-    req: ChatCompletionsRequest,
-    proxy: ProxyServer,
-) -> Result<impl warp::Reply, warp::Rejection> {
-    // Enhanced logging for successful matches
-    log_request(&warp::http::Method::POST, "/chat/completions", &headers);
-    
-    println!("🔥 === MATCHED CHAT COMPLETIONS ===");
-    println!("   Model: {}", req.model);
-    println!("   Messages: {} items", req.messages.len());
-    println!("🔥 === END MATCHED ===\n");
-    
-    match proxy.proxy_request(req).await {
-        Ok(response) => Ok(warp::reply::json(&response)),
-        Err(e) => {
-            eprintln!("Proxy error: {:#}", e);
-            Ok(warp::reply::json(&json!({
-                "error": {
-                    "message": format!("Proxy error: {}", e),
-                    "type": "proxy_error",
-                    "code": "internal_error"
-                }
-            })))
-        }
-    }
-}
-
-// Make ProxyServer cloneable for warp filters
 impl Clone for ProxyServer {
     fn clone(&self) -> Self {
         Self {
             client: self.client.clone(),
-            auth_data: self.auth_data.clone(),
+            account_pool: Arc::clone(&self.account_pool),
+            proxy_bearer_token: self.proxy_bearer_token.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_nested_token_auth() {
+        let raw: RawAuthData = serde_json::from_value(json!({
+            "tokens": {
+                "access_token": "token-a",
+                "account_id": "account-a",
+                "refresh_token": "refresh-a"
+            }
+        }))
+        .unwrap();
+
+        let auth = raw.normalize().unwrap();
+        assert_eq!(auth.tokens.unwrap().account_id, "account-a");
+    }
+
+    #[test]
+    fn normalizes_flat_token_auth() {
+        let raw: RawAuthData = serde_json::from_value(json!({
+            "access_token": "token-b",
+            "account_id": "account-b"
+        }))
+        .unwrap();
+
+        let auth = raw.normalize().unwrap();
+        assert_eq!(auth.tokens.unwrap().access_token, "token-b");
+    }
+
+    #[test]
+    fn supports_api_key_only_auth() {
+        let raw: RawAuthData = serde_json::from_value(json!({
+            "OPENAI_API_KEY": "sk-test"
+        }))
+        .unwrap();
+
+        let auth = raw.normalize().unwrap();
+        assert_eq!(auth.api_key.unwrap(), "sk-test");
+    }
+
+    #[test]
+    fn account_pool_rotates_and_skips_backed_off_accounts() {
+        let auth = AuthData {
+            auth_mode: Some("chatgpt".to_string()),
+            api_key: Some("sk-test".to_string()),
+            tokens: None,
+            last_refresh: None,
+        };
+
+        let mut pool = AccountPool {
+            accounts: vec![
+                Account {
+                    name: "account-1".to_string(),
+                    auth_path: "/tmp/a1".to_string(),
+                    auth_data: auth.clone(),
+                    last_used: None,
+                    quota: None,
+                    fail_count: 0,
+                    disabled_until: Some(chrono::Utc::now() + chrono::Duration::seconds(30)),
+                    last_error: Some("failed".to_string()),
+                },
+                Account {
+                    name: "account-2".to_string(),
+                    auth_path: "/tmp/a2".to_string(),
+                    auth_data: auth.clone(),
+                    last_used: None,
+                    quota: None,
+                    fail_count: 0,
+                    disabled_until: None,
+                    last_error: None,
+                },
+                Account {
+                    name: "account-3".to_string(),
+                    auth_path: "/tmp/a3".to_string(),
+                    auth_data: auth,
+                    last_used: None,
+                    quota: None,
+                    fail_count: 0,
+                    disabled_until: None,
+                    last_error: None,
+                },
+            ],
+            next_index: 0,
+        };
+
+        let first = pool.lease_next_account().unwrap();
+        let second = pool.lease_next_account().unwrap();
+
+        assert_eq!(first.name, "account-2");
+        assert_eq!(second.name, "account-3");
+    }
+
+    #[test]
+    fn parses_delta_sse() {
+        let summary = parse_responses_event_stream(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\" world\"}\n\ndata: [DONE]\n",
+        )
+        .unwrap();
+
+        assert_eq!(summary.text, "Hello world");
+        assert_eq!(summary.deltas.len(), 2);
+    }
+
+    #[test]
+    fn detects_refresh_need_from_token_expiry() {
+        let soon = Utc::now() + chrono::Duration::seconds(120);
+        let token = make_jwt_with_exp(soon.timestamp());
+        let auth = AuthData {
+            auth_mode: Some("chatgpt".to_string()),
+            api_key: None,
+            tokens: Some(TokenData {
+                id_token: None,
+                access_token: token,
+                account_id: "acct".to_string(),
+                refresh_token: Some("rt".to_string()),
+            }),
+            last_refresh: None,
+        };
+
+        assert!(auth.needs_refresh(Utc::now(), Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn parses_codex_quota_headers() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-codex-plan-type", "plus".parse().unwrap());
+        headers.insert("x-codex-active-limit", "codex".parse().unwrap());
+        headers.insert("x-codex-primary-used-percent", "10".parse().unwrap());
+        headers.insert("x-codex-primary-window-minutes", "300".parse().unwrap());
+        headers.insert("x-codex-primary-reset-at", "1774958172".parse().unwrap());
+        headers.insert("x-codex-secondary-used-percent", "3".parse().unwrap());
+        headers.insert("x-codex-secondary-window-minutes", "10080".parse().unwrap());
+        headers.insert("x-codex-credits-has-credits", "False".parse().unwrap());
+        headers.insert("x-codex-credits-unlimited", "False".parse().unwrap());
+
+        let quota = quota_from_headers(&headers).unwrap();
+        assert_eq!(quota.plan_type.as_deref(), Some("plus"));
+        assert_eq!(quota.primary_used_percent, Some(10));
+        assert_eq!(quota.primary_remaining_percent, Some(90));
+        assert_eq!(quota.secondary_used_percent, Some(3));
+        assert_eq!(quota.secondary_remaining_percent, Some(97));
+        assert_eq!(quota.credits_has_credits, Some(false));
+    }
+
+    #[test]
+    fn extracts_proxy_bearer_token() {
+        let mut headers = warp::http::HeaderMap::new();
+        headers.insert("authorization", "Bearer secret-token".parse().unwrap());
+        assert_eq!(extract_bearer_token(&headers), Some("secret-token"));
+    }
+
+    fn make_jwt_with_exp(exp: i64) -> String {
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(format!(r#"{{"exp":{}}}"#, exp));
+        format!("{}.{}.", header, payload)
     }
 }

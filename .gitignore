@@ -23,7 +23,9 @@ Thumbs.db
 .env.*.local
 
 # Auth files (sensitive)
+auth/
 auth.json
+*.auth.json
 *.pem
 *.key
 

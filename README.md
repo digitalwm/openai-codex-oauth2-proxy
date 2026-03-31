@@ -1,203 +1,210 @@
 # Codex OpenAI Proxy
 
-A proxy server that allows CLINE (Claude Code) and other OpenAI-compatible extensions to use ChatGPT Plus tokens from Codex authentication instead of requiring separate OpenAI API keys.
+Rust proxy that accepts OpenAI-style chat completion requests and forwards them to the ChatGPT Codex backend using credentials from one or more `auth.json` files.
 
-## Overview
+This working tree has been adapted for self-hosting and is ready to be pushed to your own repository. Local credentials such as `auth/` contents and `.env` files are meant to stay untracked.
 
-This proxy bridges the gap between:
-- **Input**: Standard OpenAI Chat Completions API format (what CLINE expects)
-- **Output**: ChatGPT Responses API format (what ChatGPT backend uses)
+## What Changed
 
-## Features
+- Supports multiple auth files through repeated `--auth-path` flags or `AUTH_PATHS`.
+- Rotates requests across accounts with round-robin selection.
+- Temporarily backs off accounts that hit retryable upstream failures such as `401`, `403`, `429`, and `5xx`.
+- Refreshes token-based ChatGPT auth before expiry and retries auth failures after refresh.
+- Exposes account health on `/health`.
+- Captures Codex quota headers on each upstream call and exposes the latest observed quota state on `/health`.
+- Supports an optional proxy-level bearer token to block unauthorized callers.
+- Avoids logging request bodies and bearer tokens.
+- Includes Docker and Compose examples.
 
-- ✅ **OpenAI API Compatibility**: Accepts standard OpenAI Chat Completions requests
-- ✅ **ChatGPT Plus Integration**: Uses your existing ChatGPT Plus tokens  
-- ✅ **Cloudflare Bypass**: Handles ChatGPT's Cloudflare protection with browser-like headers
-- ✅ **HTTPS Support**: Works with extensions requiring secure connections (via ngrok)
-- ✅ **Streaming Responses**: Full streaming support for real-time responses
-- ✅ **CLINE Compatible**: Tested extensively with CLINE VS Code extension
-- ✅ **Array Content Support**: Handles both string and array message formats from OpenAI SDK
-- ✅ **Universal Routing**: Bulletproof request routing that bypasses complex warp conflicts
+## Safety Notes
 
-## Quick Start
+- The proxy now logs only request method, path, and selected account name.
+- Request bodies, prompts, and auth headers are not printed.
+- `.dockerignore` excludes the common local `auth/` directory and JSON files so credentials are not copied into the image build context by default.
+- Token refresh persistence writes updated credentials back to the mounted `auth.json` file, so Docker mounts must be writable if you want refreshes to survive restarts.
+- If `PROXY_BEARER_TOKEN` is set, clients must send `Authorization: Bearer <token>` to reach the proxy.
+- `.gitignore` excludes `auth/`, `.env`, and related secret files so you can publish this repository without committing live credentials.
 
-### 1. Build and Run
+## Local Run
+
+Build:
 
 ```bash
-git clone https://github.com/Securiteru/codex-openai-proxy.git
-cd codex-openai-proxy
 cargo build --release
-./target/release/codex-openai-proxy --port 8888 --auth-path ~/.codex/auth.json
 ```
 
-### 2. Setup HTTPS Tunnel (Required for CLINE)
-
-Most VS Code extensions require HTTPS:
+Run with one account:
 
 ```bash
-# Install ngrok and create your own static domain at https://dashboard.ngrok.com/domains
-# Replace 'your-static-domain' with your unique domain name
-ngrok http 8888 --domain=your-static-domain.ngrok-free.app
+./target/release/codex-openai-proxy --port 8080 --auth-path ~/.codex/auth.json
 ```
 
-**Security Note**: Always use your own unique ngrok domain. Do not share your domain publicly to prevent unauthorized access to your proxy.
-
-### 3. Configure CLINE Extension
-
-In VS Code CLINE settings:
-- **Base URL**: `https://your-static-domain.ngrok-free.app`
-- **Model**: `gpt-5` (or `gpt-4`)
-- **API Key**: Any value (not used, but required by extension)
-
-### 4. Test Connection
+Run with three accounts:
 
 ```bash
-# Health check
-curl https://your-static-domain.ngrok-free.app/health
-
-# Test completion
-curl -X POST https://your-static-domain.ngrok-free.app/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer test-key" \
-  -d '{
-    "model": "gpt-5",
-    "messages": [{"role": "user", "content": "Hello!"}]
-  }'
+./target/release/codex-openai-proxy \
+  --port 8080 \
+  --auth-path /path/to/account1-auth.json \
+  --auth-path /path/to/account2-auth.json \
+  --auth-path /path/to/account3-auth.json
 ```
 
-## How It Works
+Or with an environment variable:
 
-### Request Flow
+```bash
+AUTH_PATHS=/path/to/account1-auth.json,/path/to/account2-auth.json,/path/to/account3-auth.json \
+./target/release/codex-openai-proxy --port 8080
+```
 
-1. **CLINE** → Chat Completions format → **Proxy**
-2. **Proxy** → Converts to Responses API → **ChatGPT Backend**
-3. **ChatGPT Backend** → Responses API format → **Proxy**
-4. **Proxy** → Converts to Chat Completions → **CLINE**
+Run with a proxy bearer token:
 
-### Format Conversion
+```bash
+AUTH_PATHS=/path/to/account1-auth.json \
+PROXY_BEARER_TOKEN=change-me \
+./target/release/codex-openai-proxy --port 8080
+```
 
-**Chat Completions Request:**
+## Docker
+
+Build:
+
+```bash
+docker build -t codex-openai-proxy:local .
+```
+
+Run:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -e AUTH_PATHS=/run/auth/account1.json,/run/auth/account2.json,/run/auth/account3.json \
+  -e PROXY_BEARER_TOKEN=change-me \
+  -v "$PWD/auth/account1.json:/run/auth/account1.json" \
+  -v "$PWD/auth/account2.json:/run/auth/account2.json" \
+  -v "$PWD/auth/account3.json:/run/auth/account3.json" \
+  codex-openai-proxy:local
+```
+
+Compose example:
+
+```bash
+cp .env.example .env
+# edit .env and set PROXY_BEARER_TOKEN
+docker compose up --build
+```
+
+The included [docker-compose.yml](/docker-sites/openai-proxy/docker-compose.yml) expects:
+
+- `./auth/account1.json`
+- `./auth/account2.json`
+- `./auth/account3.json`
+
+Those mounts are intentionally writable so refreshed tokens can be persisted.
+If `.env` defines `PROXY_BEARER_TOKEN`, every request to the proxy must include that bearer token.
+
+## Endpoints
+
+- `GET /health`
+- `GET /models`
+- `GET /v1/models`
+- `POST /chat/completions`
+- `POST /v1/chat/completions`
+
+When `PROXY_BEARER_TOKEN` is set, call the proxy with:
+
+```bash
+curl -sS http://127.0.0.1:8080/health \
+  -H 'Authorization: Bearer change-me'
+```
+
+Example health response:
+
 ```json
 {
-  "model": "gpt-5",
-  "messages": [
-    {"role": "user", "content": "Hello!"}
+  "status": "ok",
+  "service": "codex-openai-proxy",
+  "accounts_loaded": 3,
+  "accounts_healthy": 2,
+  "next_account": "account-2",
+  "accounts": [
+    {
+      "name": "account-1",
+      "path": "/run/auth/account1.json",
+      "healthy": true,
+      "quota": {
+        "observed_at": "2026-03-31T07:40:00Z",
+        "source": "x-codex-*",
+        "plan_type": "plus",
+        "active_limit": "codex",
+        "primary_used_percent": 10,
+        "primary_remaining_percent": 90,
+        "primary_window_minutes": 300,
+        "primary_reset_at": 1774958172,
+        "primary_reset_after_seconds": 15689,
+        "secondary_used_percent": 3,
+        "secondary_remaining_percent": 97,
+        "secondary_window_minutes": 10080,
+        "secondary_reset_at": 1775544972,
+        "secondary_reset_after_seconds": 602489,
+        "credits_has_credits": false,
+        "credits_unlimited": false,
+        "credits_balance": null,
+        "raw_limit_name": null
+      },
+      "fail_count": 0,
+      "disabled_until": null,
+      "last_error": null
+    }
   ]
 }
 ```
 
-**Responses API Request:**
+The quota fields are inferred from observed `x-codex-*` response headers returned by the ChatGPT Codex backend. They appear to expose used percentages and reset windows, not an absolute token count.
+
+## Auth File Formats
+
+The proxy accepts either nested token data:
+
 ```json
 {
-  "model": "gpt-5", 
-  "instructions": "You are a helpful AI assistant.",
-  "input": [
-    {
-      "type": "message",
-      "role": "user", 
-      "content": [{"type": "input_text", "text": "Hello!"}]
-    }
-  ],
-  "tools": [],
-  "tool_choice": "auto",
-  "store": false,
-  "stream": false
+  "tokens": {
+    "access_token": "eyJ...",
+    "account_id": "uuid",
+    "refresh_token": "optional"
+  }
 }
 ```
 
-## Configuration
-
-### Command Line Options
-
-```bash
-codex-openai-proxy [OPTIONS]
-
-Options:
-  -p, --port <PORT>          Port to listen on [default: 8080]
-      --auth-path <PATH>     Path to Codex auth.json [default: ~/.codex/auth.json]
-  -h, --help                 Print help
-  -v, --version              Print version
-```
-
-### Authentication
-
-The proxy automatically reads authentication from your Codex `auth.json` file:
+Or flat token data:
 
 ```json
 {
   "access_token": "eyJ...",
-  "account_id": "db1fc050-5df3-42c1-be65-9463d9d23f0b",
-  "api_key": "sk-proj-..."
+  "account_id": "uuid",
+  "refresh_token": "optional"
 }
 ```
 
-**Priority**: Uses `access_token` + `account_id` for ChatGPT Plus accounts, falls back to `api_key` for standard OpenAI accounts.
+Or API key data:
 
-## API Endpoints
-
-### Health Check
-- **GET** `/health`
-- Returns service status
-
-### Chat Completions
-- **POST** `/v1/chat/completions`
-- OpenAI-compatible chat completions endpoint
-- Supports: messages, model, temperature, max_tokens, stream, tools
-
-## Troubleshooting
-
-### Common Issues
-
-**Connection Refused:**
-```bash
-# Check if proxy is running
-curl http://localhost:8080/health
+```json
+{
+  "OPENAI_API_KEY": "sk-..."
+}
 ```
 
-**Authentication Errors:**
-```bash
-# Verify auth.json exists and has valid tokens
-cat ~/.codex/auth.json | jq .
-```
+## Token Refresh
 
-**Backend Errors:**
-```bash
-# Check proxy logs for detailed error messages
-RUST_LOG=debug cargo run
-```
+For ChatGPT-style auth files, the proxy checks token expiry continuously:
 
-### Debug Mode
+- before each request for the selected account
+- in a background refresh loop every 60 seconds
+- immediately after upstream `401` or `403`
 
-```bash
-# Run with debug logging
-RUST_LOG=debug cargo run -- --port 8080
-
-# Test with verbose curl
-curl -v -X POST http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "gpt-5", "messages": [{"role": "user", "content": "Test"}]}'
-```
+Refresh is inferred from the observed Codex auth file format and the OpenAI OAuth client used by Codex login. The proxy refreshes through `https://auth.openai.com/oauth/token` and updates `access_token`, `id_token`, `refresh_token`, and `last_refresh` in the same file when possible.
 
 ## Development
 
-### Building
-
 ```bash
-cargo build
-cargo test
-cargo clippy
 cargo fmt
+cargo test
 ```
-
-### Adding Features
-
-The proxy is designed to be extensible:
-
-- **New endpoints**: Add routes in `main.rs`
-- **Format conversion**: Modify conversion functions
-- **Authentication**: Extend `AuthData` structure
-- **Streaming**: Add SSE support for real-time responses
-
-## License
-
-This project is part of the Codex ecosystem and follows the same licensing as the main Codex repository.
