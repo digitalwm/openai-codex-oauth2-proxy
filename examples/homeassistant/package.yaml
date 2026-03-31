@@ -1,0 +1,63 @@
+rest:
+  - resource: "http://OPENAI_PROXY_HOST:8080/health"
+    scan_interval: 60
+    timeout: 15
+    headers:
+      Authorization: !secret openai_codex_proxy_bearer
+    sensor:
+      - name: "OpenAI Codex Proxy Status"
+        unique_id: openai_codex_proxy_status
+        icon: mdi:api
+        value_template: "{{ value_json.status }}"
+        json_attributes:
+          - service
+          - accounts_loaded
+          - accounts_healthy
+          - next_account
+          - accounts
+
+template:
+  - sensor:
+      - name: "OpenAI Codex Proxy Accounts Loaded"
+        unique_id: openai_codex_proxy_accounts_loaded
+        icon: mdi:account-multiple
+        state: >
+          {{ state_attr('sensor.openai_codex_proxy_status', 'accounts_loaded') | int(0) }}
+
+      - name: "OpenAI Codex Proxy Accounts Healthy"
+        unique_id: openai_codex_proxy_accounts_healthy
+        icon: mdi:heart-pulse
+        state: >
+          {{ state_attr('sensor.openai_codex_proxy_status', 'accounts_healthy') | int(0) }}
+
+      - name: "OpenAI Codex Proxy Next Account"
+        unique_id: openai_codex_proxy_next_account
+        icon: mdi:swap-horizontal
+        state: >
+          {{ state_attr('sensor.openai_codex_proxy_status', 'next_account') or 'unknown' }}
+
+      - name: "OpenAI Codex Proxy Plan"
+        unique_id: openai_codex_proxy_plan
+        icon: mdi:license
+        state: >
+          {% set accounts = state_attr('sensor.openai_codex_proxy_status', 'accounts') or [] %}
+          {% set quota = accounts[0].quota if accounts and accounts[0].quota is defined else none %}
+          {{ quota.plan_type if quota and quota.plan_type is defined and quota.plan_type else 'unknown' }}
+
+      - name: "OpenAI Codex Proxy Primary Remaining"
+        unique_id: openai_codex_proxy_primary_remaining
+        unit_of_measurement: "%"
+        icon: mdi:gauge
+        state: >
+          {% set accounts = state_attr('sensor.openai_codex_proxy_status', 'accounts') or [] %}
+          {% set quota = accounts[0].quota if accounts and accounts[0].quota is defined else none %}
+          {{ quota.primary_remaining_percent if quota and quota.primary_remaining_percent is defined and quota.primary_remaining_percent is not none else 'unknown' }}
+
+      - name: "OpenAI Codex Proxy Secondary Remaining"
+        unique_id: openai_codex_proxy_secondary_remaining
+        unit_of_measurement: "%"
+        icon: mdi:calendar-week
+        state: >
+          {% set accounts = state_attr('sensor.openai_codex_proxy_status', 'accounts') or [] %}
+          {% set quota = accounts[0].quota if accounts and accounts[0].quota is defined else none %}
+          {{ quota.secondary_remaining_percent if quota and quota.secondary_remaining_percent is defined and quota.secondary_remaining_percent is not none else 'unknown' }}

@@ -32,6 +32,10 @@ struct Args {
     /// Optional bearer token required from clients calling this proxy.
     #[arg(long, env = "PROXY_BEARER_TOKEN")]
     proxy_bearer_token: Option<String>,
+
+    /// Enable verbose request/debug logging.
+    #[arg(long, env = "PROXY_DEBUG_LOGS", default_value_t = false)]
+    debug_logs: bool,
 }
 
 #[allow(dead_code)]
@@ -85,7 +89,8 @@ struct Usage {
 #[derive(Serialize, Debug)]
 struct ResponsesApiRequest {
     model: String,
-    instructions: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<String>,
     input: Vec<ResponseItem>,
     tools: Vec<Value>,
     tool_choice: Value,
@@ -111,6 +116,7 @@ enum ResponseItem {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ContentItem {
     InputText { text: String },
+    OutputText { text: String },
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -194,6 +200,7 @@ struct ProxyServer {
     client: Client,
     account_pool: Arc<Mutex<AccountPool>>,
     proxy_bearer_token: Option<String>,
+    debug_logs: bool,
 }
 
 const TOKEN_REFRESH_THRESHOLD: Duration = Duration::from_secs(300);
@@ -541,7 +548,11 @@ impl AuthData {
 }
 
 impl ProxyServer {
-    async fn new(auth_paths: &[String], proxy_bearer_token: Option<String>) -> Result<Self> {
+    async fn new(
+        auth_paths: &[String],
+        proxy_bearer_token: Option<String>,
+        debug_logs: bool,
+    ) -> Result<Self> {
         let client = Client::builder()
             .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
             .build()
@@ -552,6 +563,7 @@ impl ProxyServer {
             client,
             account_pool: Arc::new(Mutex::new(account_pool)),
             proxy_bearer_token,
+            debug_logs,
         };
         server.spawn_refresh_loop();
         Ok(server)
@@ -607,6 +619,7 @@ impl ProxyServer {
                 "/backend-api/codex/responses",
                 Some(&effective_lease.name),
             );
+            self.debug_log_chat_request(&chat_req);
 
             match self.send_backend_request(&effective_lease, &chat_req).await {
                 Ok(response) => {
@@ -696,6 +709,14 @@ impl ProxyServer {
         chat_req: &ChatCompletionsRequest,
     ) -> std::result::Result<BackendResponse, AttemptError> {
         let responses_req = self.convert_chat_to_responses(chat_req);
+        if self.debug_logs {
+            println!(
+                "DEBUG upstream request: account={}, model={}, input_messages={}",
+                lease.name,
+                responses_req.model,
+                responses_req.input.len()
+            );
+        }
         let mut request_builder = self
             .client
             .post("https://chatgpt.com/backend-api/codex/responses")
@@ -750,6 +771,13 @@ impl ProxyServer {
 
         if !status.is_success() {
             let summary = summarize_body(&body);
+            if self.debug_logs {
+                println!(
+                    "DEBUG upstream error: status={}, body={}",
+                    status,
+                    preview_text(&body, 800)
+                );
+            }
             if status.as_u16() == 401 || status.as_u16() == 403 {
                 return Err(AttemptError::auth_retryable(format!(
                     "Upstream status {} for {}: {}",
@@ -772,6 +800,13 @@ impl ProxyServer {
         let summary = parse_responses_event_stream(&body).map_err(|error| {
             AttemptError::fatal(format!("Failed to parse upstream SSE: {}", error))
         })?;
+        if self.debug_logs {
+            println!(
+                "DEBUG upstream success: response_id={:?}, text_preview={}",
+                summary.response_id,
+                preview_text(&summary.text, 180)
+            );
+        }
 
         Ok(BackendResponse {
             model: chat_req.model.clone(),
@@ -905,31 +940,97 @@ impl ProxyServer {
 
     fn convert_chat_to_responses(&self, chat_req: &ChatCompletionsRequest) -> ResponsesApiRequest {
         let mut input = Vec::new();
+        let mut system_instructions = Vec::new();
 
         for msg in &chat_req.messages {
+            if msg.role == "system" {
+                let text = message_content_to_text(&msg.content);
+                if !text.trim().is_empty() {
+                    system_instructions.push(text);
+                }
+                continue;
+            }
             input.push(ResponseItem::Message {
                 id: None,
                 role: msg.role.clone(),
-                content: vec![ContentItem::InputText {
-                    text: message_content_to_text(&msg.content),
-                }],
+                content: vec![content_item_for_role(
+                    &msg.role,
+                    message_content_to_text(&msg.content),
+                )],
             });
         }
 
+        let instructions =
+            (!system_instructions.is_empty()).then(|| system_instructions.join("\n\n"));
+        let tools = normalize_tools(chat_req.tools.as_deref().unwrap_or(&[]));
+        let tool_choice = normalize_tool_choice(chat_req.tool_choice.as_ref());
+
         ResponsesApiRequest {
             model: chat_req.model.clone(),
-            instructions: "You are a helpful AI assistant. Provide clear, accurate, and concise responses to user questions and requests.".to_string(),
+            instructions,
             input,
-            tools: chat_req.tools.clone().unwrap_or_default(),
-            tool_choice: chat_req
-                .tool_choice
-                .clone()
-                .unwrap_or_else(|| Value::String("auto".to_string())),
+            tools,
+            tool_choice,
             parallel_tool_calls: false,
             reasoning: None,
             store: false,
             stream: true,
             include: vec![],
+        }
+    }
+
+    fn debug_log_chat_request(&self, chat_req: &ChatCompletionsRequest) {
+        if !self.debug_logs {
+            return;
+        }
+
+        let roles = chat_req
+            .messages
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect::<Vec<_>>();
+        let system_count = chat_req
+            .messages
+            .iter()
+            .filter(|message| message.role == "system")
+            .count();
+
+        println!(
+            "DEBUG inbound chat request: model={}, stream={:?}, messages={}, roles={:?}, system_messages={}, tools={}",
+            chat_req.model,
+            chat_req.stream,
+            chat_req.messages.len(),
+            roles,
+            system_count,
+            chat_req.tools.as_ref().map(|tools| tools.len()).unwrap_or(0)
+        );
+
+        if let Some(tools) = &chat_req.tools {
+            for (index, tool) in tools.iter().enumerate() {
+                let tool_name = tool
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    .or_else(|| tool.get("name").and_then(Value::as_str))
+                    .unwrap_or("unknown");
+                println!(
+                    "DEBUG tool[{}]: type={}, name={}",
+                    index,
+                    tool.get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown"),
+                    tool_name
+                );
+            }
+        }
+
+        for (index, message) in chat_req.messages.iter().enumerate() {
+            println!(
+                "DEBUG message[{}]: role={}, preview={}",
+                index,
+                message.role,
+                preview_text(&message_content_to_text(&message.content), 180)
+            );
         }
     }
 
@@ -1025,6 +1126,64 @@ async fn persist_auth_file(path: &str, auth_data: &AuthData) -> Result<()> {
     Ok(())
 }
 
+fn normalize_tools(tools: &[Value]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|tool| {
+            let Some(tool_type) = tool.get("type").and_then(Value::as_str) else {
+                return tool.clone();
+            };
+
+            match tool_type {
+                "function" => {
+                    if let Some(function) = tool.get("function").and_then(Value::as_object) {
+                        json!({
+                            "type": "function",
+                            "name": function.get("name").cloned().unwrap_or(Value::Null),
+                            "description": function.get("description").cloned().unwrap_or(Value::Null),
+                            "parameters": function.get("parameters").cloned().unwrap_or_else(|| json!({}))
+                        })
+                    } else {
+                        tool.clone()
+                    }
+                }
+                _ => tool.clone(),
+            }
+        })
+        .collect()
+}
+
+fn normalize_tool_choice(tool_choice: Option<&Value>) -> Value {
+    let Some(choice) = tool_choice else {
+        return Value::String("auto".to_string());
+    };
+
+    if let Some(choice_str) = choice.as_str() {
+        return Value::String(choice_str.to_string());
+    }
+
+    if let Some(choice_type) = choice.get("type").and_then(Value::as_str) {
+        match choice_type {
+            "auto" | "none" | "required" => return Value::String(choice_type.to_string()),
+            "function" => {
+                if let Some(function_name) = choice
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                {
+                    return json!({
+                        "type": "function",
+                        "name": function_name
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    choice.clone()
+}
+
 fn quota_from_headers(headers: &reqwest::header::HeaderMap) -> Option<QuotaSnapshot> {
     let has_codex_headers = headers
         .keys()
@@ -1114,6 +1273,13 @@ fn message_content_to_text(content: &Value) -> String {
             .collect::<Vec<_>>()
             .join(" "),
         _ => content.to_string(),
+    }
+}
+
+fn content_item_for_role(role: &str, text: String) -> ContentItem {
+    match role {
+        "assistant" => ContentItem::OutputText { text },
+        _ => ContentItem::InputText { text },
     }
 }
 
@@ -1260,6 +1426,14 @@ fn summarize_body(body: &str) -> String {
         .replace('\n', " ")
 }
 
+fn preview_text(text: &str, max_chars: usize) -> String {
+    let mut preview = text.chars().take(max_chars).collect::<String>();
+    if text.chars().count() > max_chars {
+        preview.push_str("...");
+    }
+    preview.replace('\n', "\\n")
+}
+
 fn log_request(method: &str, path: &str, account: Option<&str>) {
     let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3f UTC");
     match account {
@@ -1284,7 +1458,12 @@ async fn main() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
 
-    let proxy = ProxyServer::new(&args.auth_paths, args.proxy_bearer_token.clone()).await?;
+    let proxy = ProxyServer::new(
+        &args.auth_paths,
+        args.proxy_bearer_token.clone(),
+        args.debug_logs,
+    )
+    .await?;
     let health = proxy.health().await;
 
     println!("Initializing Codex OpenAI Proxy...");
@@ -1293,6 +1472,14 @@ async fn main() -> Result<()> {
     println!(
         "Proxy bearer auth: {}",
         if args.proxy_bearer_token.is_some() {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!(
+        "Debug logs: {}",
+        if args.debug_logs {
             "enabled"
         } else {
             "disabled"
@@ -1439,6 +1626,7 @@ impl Clone for ProxyServer {
             client: self.client.clone(),
             account_pool: Arc::clone(&self.account_pool),
             proxy_bearer_token: self.proxy_bearer_token.clone(),
+            debug_logs: self.debug_logs,
         }
     }
 }
@@ -1594,6 +1782,117 @@ mod tests {
         let mut headers = warp::http::HeaderMap::new();
         headers.insert("authorization", "Bearer secret-token".parse().unwrap());
         assert_eq!(extract_bearer_token(&headers), Some("secret-token"));
+    }
+
+    #[test]
+    fn moves_system_messages_into_instructions() {
+        let proxy = ProxyServer {
+            client: Client::builder().build().unwrap(),
+            account_pool: Arc::new(Mutex::new(AccountPool {
+                accounts: vec![],
+                next_index: 0,
+            })),
+            proxy_bearer_token: None,
+            debug_logs: false,
+        };
+
+        let request = ChatCompletionsRequest {
+            model: "gpt-5".to_string(),
+            messages: vec![
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: Value::String("System instruction".to_string()),
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: Value::String("Hello".to_string()),
+                },
+            ],
+            temperature: None,
+            max_tokens: None,
+            stream: None,
+            tools: None,
+            tool_choice: None,
+        };
+
+        let translated = proxy.convert_chat_to_responses(&request);
+        assert_eq!(
+            translated.instructions.as_deref(),
+            Some("System instruction")
+        );
+        assert_eq!(translated.input.len(), 1);
+        match &translated.input[0] {
+            ResponseItem::Message { role, .. } => assert_eq!(role, "user"),
+        }
+    }
+
+    #[test]
+    fn normalizes_function_tools_for_upstream() {
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "lookup_state",
+                "description": "Look up a state",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "entity_id": {"type": "string"}
+                    }
+                }
+            }
+        })];
+
+        let normalized = normalize_tools(&tools);
+        assert_eq!(normalized[0]["type"], "function");
+        assert_eq!(normalized[0]["name"], "lookup_state");
+        assert_eq!(normalized[0]["description"], "Look up a state");
+        assert!(normalized[0].get("function").is_none());
+    }
+
+    #[test]
+    fn encodes_assistant_history_as_output_text() {
+        let proxy = ProxyServer {
+            client: Client::builder().build().unwrap(),
+            account_pool: Arc::new(Mutex::new(AccountPool {
+                accounts: vec![],
+                next_index: 0,
+            })),
+            proxy_bearer_token: None,
+            debug_logs: false,
+        };
+
+        let request = ChatCompletionsRequest {
+            model: "gpt-5".to_string(),
+            messages: vec![
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: Value::String("Hello".to_string()),
+                },
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Value::String("Hi there".to_string()),
+                },
+            ],
+            temperature: None,
+            max_tokens: None,
+            stream: None,
+            tools: None,
+            tool_choice: None,
+        };
+
+        let translated = proxy.convert_chat_to_responses(&request);
+        match &translated.input[0] {
+            ResponseItem::Message { content, .. } => match &content[0] {
+                ContentItem::InputText { .. } => {}
+                _ => panic!("user history should be input_text"),
+            },
+        }
+        match &translated.input[1] {
+            ResponseItem::Message { content, .. } => match &content[0] {
+                ContentItem::OutputText { .. } => {}
+                _ => panic!("assistant history should be output_text"),
+            },
+        }
     }
 
     fn make_jwt_with_exp(exp: i64) -> String {

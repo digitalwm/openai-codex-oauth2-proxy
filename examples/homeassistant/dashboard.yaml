@@ -1,0 +1,30 @@
+title: OpenAI Codex Proxy
+views:
+  - title: Proxy
+    path: codex-proxy
+    icon: mdi:api
+    cards:
+      - type: entities
+        title: OpenAI Codex Proxy
+        entities:
+          - entity: sensor.openai_codex_proxy_status
+            name: Status
+          - entity: sensor.openai_codex_proxy_accounts_loaded
+            name: Accounts Loaded
+          - entity: sensor.openai_codex_proxy_accounts_healthy
+            name: Accounts Healthy
+          - entity: sensor.openai_codex_proxy_next_account
+            name: Next Account
+          - entity: sensor.openai_codex_proxy_plan
+            name: Plan
+          - entity: sensor.openai_codex_proxy_primary_remaining
+            name: Primary Remaining
+          - entity: sensor.openai_codex_proxy_secondary_remaining
+            name: Secondary Remaining
+
+      - type: markdown
+        title: Raw Health JSON
+        content: >
+          ```json
+          {{ state_attr('sensor.openai_codex_proxy_status', 'accounts') | tojson }}
+          ```

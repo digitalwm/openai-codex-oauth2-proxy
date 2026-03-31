@@ -65,6 +65,14 @@ PROXY_BEARER_TOKEN=change-me \
 ./target/release/codex-openai-proxy --port 8080
 ```
 
+Temporarily enable detailed debug logs:
+
+```bash
+AUTH_PATHS=/path/to/account1-auth.json \
+PROXY_DEBUG_LOGS=true \
+./target/release/codex-openai-proxy --port 8080
+```
+
 ## Docker
 
 Build:
@@ -209,3 +217,28 @@ Refresh is inferred from the observed Codex auth file format and the OpenAI OAut
 cargo fmt
 cargo test
 ```
+
+## Home Assistant
+
+This repository includes a ready-to-use Home Assistant example under [examples/homeassistant/package.yaml](/docker-sites/openai-proxy/examples/homeassistant/package.yaml) and [examples/homeassistant/dashboard.yaml](/docker-sites/openai-proxy/examples/homeassistant/dashboard.yaml).
+
+Based on the official Home Assistant REST integration docs:
+https://www.home-assistant.io/integrations/rest/
+
+Suggested setup:
+
+1. Copy `examples/homeassistant/package.yaml` into your Home Assistant packages directory.
+2. Replace `OPENAI_PROXY_HOST` with the hostname or IP of this proxy.
+3. Add a secret named `openai_codex_proxy_bearer` in Home Assistant `secrets.yaml`.
+4. Restart Home Assistant.
+5. Import or copy the Lovelace example from `examples/homeassistant/dashboard.yaml`.
+
+The example creates sensors for:
+
+- proxy status
+- loaded and healthy account counts
+- next selected account
+- observed plan type
+- primary and secondary remaining quota percentages
+
+It also shows the raw `accounts` payload from the proxy health response, which includes per-account quota and reset-window information.
