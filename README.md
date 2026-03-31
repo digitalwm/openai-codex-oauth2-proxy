@@ -3,6 +3,7 @@
 Rust proxy that accepts OpenAI-style chat completion requests and forwards them to the ChatGPT Codex backend using credentials from one or more `auth.json` files.
 
 This working tree has been adapted for self-hosting and is ready to be pushed to your own repository. Local credentials such as `auth/` contents and `.env` files are meant to stay untracked.
+It started from the earlier `Securiteru/codex-openai-proxy` project and has been extended here with multi-account rotation, token refresh, quota tracking, Docker support, and proxy-side access control.
 
 ## What Changed
 
