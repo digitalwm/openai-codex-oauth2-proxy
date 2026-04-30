@@ -23,7 +23,28 @@ views:
             name: Secondary Remaining
 
       - type: markdown
-        title: Raw Health JSON
+        title: Account Capacity
+        content: >
+          {% set accounts = state_attr('sensor.openai_codex_proxy_status', 'accounts') or [] %}
+          {% if not accounts %}
+          No account status data available yet.
+          {% else %}
+          {% for account in accounts %}
+          ### {{ account.name }}
+          - Healthy: {{ account.healthy }}
+          - Last used: {{ account.last_used or 'never' }}
+          - Last refresh: {{ account.last_refresh or 'unknown' }}
+          - Access token expires in: {{ account.access_token_expires_in_seconds if account.access_token_expires_in_seconds is not none else 'unknown' }} s
+          - Refresh recommended: {{ account.refresh_recommended }}
+          - Disabled for: {{ account.disabled_for_seconds if account.disabled_for_seconds is not none else 0 }} s
+          - Primary remaining: {{ account.quota.primary_remaining_percent if account.quota is defined and account.quota and account.quota.primary_remaining_percent is defined and account.quota.primary_remaining_percent is not none else 'unknown' }}%
+          - Secondary remaining: {{ account.quota.secondary_remaining_percent if account.quota is defined and account.quota and account.quota.secondary_remaining_percent is defined and account.quota.secondary_remaining_percent is not none else 'unknown' }}%
+
+          {% endfor %}
+          {% endif %}
+
+      - type: markdown
+        title: Raw Status JSON
         content: >
           ```json
           {{ state_attr('sensor.openai_codex_proxy_status', 'accounts') | tojson }}

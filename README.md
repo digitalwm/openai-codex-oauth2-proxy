@@ -13,6 +13,7 @@ It started from the earlier `Securiteru/codex-openai-proxy` project and has been
 - Refreshes token-based ChatGPT auth before expiry and retries auth failures after refresh.
 - Exposes account health on `/health`.
 - Captures Codex quota headers on each upstream call and exposes the latest observed quota state on `/health`.
+- Runs a background quota probe for each account on startup and once per hour, so quota fields stay populated even without user traffic.
 - Supports an optional proxy-level bearer token to block unauthorized callers.
 - Avoids logging request bodies and bearer tokens.
 - Includes Docker and Compose examples.
@@ -65,6 +66,14 @@ PROXY_BEARER_TOKEN=change-me \
 ./target/release/codex-openai-proxy --port 8080
 ```
 
+Run with a dedicated Responses API key:
+
+```bash
+AUTH_PATHS=/path/to/account1-auth.json \
+RESPONSES_API_KEY=sk-proj-or-sk-live-key \
+./target/release/codex-openai-proxy --port 8080
+```
+
 Temporarily enable detailed debug logs:
 
 ```bash
@@ -87,6 +96,7 @@ Run:
 docker run --rm -p 8080:8080 \
   -e AUTH_PATHS=/run/auth/account1.json,/run/auth/account2.json,/run/auth/account3.json \
   -e PROXY_BEARER_TOKEN=change-me \
+  -e RESPONSES_API_KEY=sk-proj-or-sk-live-key \
   -v "$PWD/auth/account1.json:/run/auth/account1.json" \
   -v "$PWD/auth/account2.json:/run/auth/account2.json" \
   -v "$PWD/auth/account3.json:/run/auth/account3.json" \
@@ -97,7 +107,7 @@ Compose example:
 
 ```bash
 cp .env.example .env
-# edit .env and set PROXY_BEARER_TOKEN
+# edit .env and set PROXY_BEARER_TOKEN and optionally RESPONSES_API_KEY
 docker compose up --build
 ```
 
@@ -109,12 +119,24 @@ The included [docker-compose.yml](/docker-sites/openai-proxy/docker-compose.yml)
 
 Those mounts are intentionally writable so refreshed tokens can be persisted.
 If `.env` defines `PROXY_BEARER_TOKEN`, every request to the proxy must include that bearer token.
+If `.env` defines `RESPONSES_API_KEY`, `/responses` and `/v1/responses` will use that API key instead of the rotating account auth files.
+`QUOTA_PROBE_INTERVAL_SECONDS` controls the background quota probe cadence (default `3600`).
+`QUOTA_PROBE_MODEL` controls the probe model (default `gpt-5.4`).
+`QUOTA_PROBE_INPUT` controls the probe input text (default `hi`).
 
 ## Endpoints
 
 - `GET /health`
+- `GET /status`
+- `GET /v1/status`
+- `GET /model-status`
+- `GET /v1/model-status`
 - `GET /models`
 - `GET /v1/models`
+- `POST /responses`
+- `POST /v1/responses`
+- `POST /embeddings`
+- `POST /v1/embeddings`
 - `POST /chat/completions`
 - `POST /v1/chat/completions`
 
@@ -168,6 +190,35 @@ Example health response:
 ```
 
 The quota fields are inferred from observed `x-codex-*` response headers returned by the ChatGPT Codex backend. They appear to expose used percentages and reset windows, not an absolute token count.
+
+For a more detailed per-account view, use `/status` or `/v1/status`. That payload includes:
+
+- last used time per account
+- last refresh time
+- access token expiry and seconds remaining
+- ID token expiry and seconds remaining
+- whether refresh is currently recommended
+- temporary disable/backoff timers
+- latest observed quota/reset data
+
+For model discovery:
+
+- `/models` and `/v1/models` proxy the upstream `https://api.openai.com/v1/models` response using one of the configured accounts
+- `/model-status` and `/v1/model-status` fetch the upstream model list for every configured account and also probe a small built-in candidate set for chat and embeddings support
+
+The current probe candidates are:
+
+- chat: `gpt-4`, `gpt-5`, `gpt-5.4`
+- embeddings: `text-embedding-3-small`, `text-embedding-3-large`
+
+`/model-status` is intentionally more expensive than `/models` because it performs live test requests per account. Use it for diagnostics, not as a high-frequency polling endpoint.
+
+For direct OpenAI Responses API compatibility:
+
+- `/responses` and `/v1/responses` proxy requests to the upstream `https://api.openai.com/v1/responses` endpoint
+- if `RESPONSES_API_KEY` is configured, that route uses the dedicated API key instead of the rotating auth-file accounts
+- non-streaming JSON responses are supported, including `input_file` content items such as `data:application/pdf;base64,...`
+- streaming Responses API requests currently return `501 Not Implemented`
 
 ## Auth File Formats
 
@@ -233,12 +284,22 @@ Suggested setup:
 4. Restart Home Assistant.
 5. Import or copy the Lovelace example from `examples/homeassistant/dashboard.yaml`.
 
-The example creates sensors for:
+The example now reads `/status` and creates sensors for:
 
 - proxy status
 - loaded and healthy account counts
 - next selected account
-- observed plan type
+- observed plan types across accounts
+- lowest primary and secondary remaining quota percentages across accounts
+
+The dashboard example also renders a list of all accounts with:
+
+- current health
+- last used time
+- last refresh time
+- token expiry countdowns
+- refresh recommendation state
+- backoff timer
 - primary and secondary remaining quota percentages
 
-It also shows the raw `accounts` payload from the proxy health response, which includes per-account quota and reset-window information.
+It also shows the raw `accounts` payload from the proxy status response for debugging.
