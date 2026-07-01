@@ -82,6 +82,14 @@ PROXY_DEBUG_LOGS=true \
 ./target/release/codex-openai-proxy --port 8080
 ```
 
+Set a bounded upstream timeout:
+
+```bash
+AUTH_PATHS=/path/to/account1-auth.json \
+UPSTREAM_TIMEOUT_SECONDS=300 \
+./target/release/codex-openai-proxy --port 8080
+```
+
 ## Docker
 
 Build:
@@ -120,6 +128,8 @@ The included [docker-compose.yml](/docker-sites/openai-proxy/docker-compose.yml)
 Those mounts are intentionally writable so refreshed tokens can be persisted.
 If `.env` defines `PROXY_BEARER_TOKEN`, every request to the proxy must include that bearer token.
 If `.env` defines `RESPONSES_API_KEY`, `/responses` and `/v1/responses` will use that API key instead of the rotating account auth files.
+`UPSTREAM_TIMEOUT_SECONDS` controls how long the proxy waits for an upstream response before failing the request (default `300`).
+`CODEX_USAGE_CACHE_SECONDS` controls how long `/status` and the dashboard cache each account's best-effort Codex usage/reset-credit probe (default `3600`).
 `QUOTA_PROBE_INTERVAL_SECONDS` controls the background quota probe cadence (default `3600`).
 `QUOTA_PROBE_MODEL` controls the probe model (default `gpt-5.4`).
 `QUOTA_PROBE_INPUT` controls the probe input text (default `hi`).
@@ -191,6 +201,8 @@ Example health response:
 
 The quota fields are inferred from observed `x-codex-*` response headers returned by the ChatGPT Codex backend. They appear to expose used percentages and reset windows, not an absolute token count.
 
+The dashboard and `/status` also attempt a read-only Codex usage fetch from `https://chatgpt.com/api/codex/usage` for each account. When that endpoint returns JSON, the proxy exposes the reset-credit payload under `accounts[].codex_usage.reset_credits` and renders it as `Usage Resets` on the dashboard. This does not call the reset-consume endpoint. Results, including failures, are cached per account by `CODEX_USAGE_CACHE_SECONDS` so private endpoint challenges do not slow every dashboard load.
+
 For a more detailed per-account view, use `/status` or `/v1/status`. That payload includes:
 
 - last used time per account
@@ -200,11 +212,14 @@ For a more detailed per-account view, use `/status` or `/v1/status`. That payloa
 - whether refresh is currently recommended
 - temporary disable/backoff timers
 - latest observed quota/reset data
+- best-effort Codex `/usage` reset-credit data when available
 
 For model discovery:
 
-- `/models` and `/v1/models` proxy the upstream `https://api.openai.com/v1/models` response using one of the configured accounts
-- `/model-status` and `/v1/model-status` fetch the upstream model list for every configured account and also probe a small built-in candidate set for chat and embeddings support
+- `/models` and `/v1/models` fetch the Codex-auth model catalog from `https://chatgpt.com/backend-api/codex/models?client_version=1.0.0`, then normalize it into an OpenAI-style `{"object":"list","data":[...]}` response
+- each returned model keeps Codex capability fields such as `default_reasoning_level` and `supported_reasoning_levels`, which are the available Think levels
+- `/model-status` and `/v1/model-status` fetch that same Codex-backed model list for every configured account and also probe a small built-in candidate set for chat and embeddings support
+- the dashboard now includes the same translated model list, including Think defaults and supported levels
 
 The current probe candidates are:
 

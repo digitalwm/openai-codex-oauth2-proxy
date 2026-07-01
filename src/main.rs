@@ -1,14 +1,13 @@
 use std::collections::BTreeMap;
-use std::convert::Infallible;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Utc};
 use clap::Parser;
-use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -56,6 +55,14 @@ struct Args {
     /// Input text used for background quota probes.
     #[arg(long, env = "QUOTA_PROBE_INPUT", default_value = "hi")]
     quota_probe_input: String,
+
+    /// Seconds to wait for an upstream request before failing.
+    #[arg(long, env = "UPSTREAM_TIMEOUT_SECONDS", default_value_t = 300)]
+    upstream_timeout_seconds: u64,
+
+    /// Seconds to cache best-effort Codex usage/reset-credit probes.
+    #[arg(long, env = "CODEX_USAGE_CACHE_SECONDS", default_value_t = 3600)]
+    codex_usage_cache_seconds: u64,
 }
 
 #[allow(dead_code)]
@@ -264,6 +271,48 @@ struct StatusResponse {
 }
 
 #[derive(Serialize)]
+struct ModelsApiResponse {
+    object: &'static str,
+    data: Vec<ModelsApiEntry>,
+}
+
+#[derive(Serialize, Debug, Clone)]
+struct ModelsApiEntry {
+    id: String,
+    object: &'static str,
+    created: i64,
+    owned_by: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    input_modalities: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_window: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_context_window: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_reasoning_level: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    supported_reasoning_levels: Vec<ModelReasoningLevel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_verbosity: Option<String>,
+    support_verbosity: bool,
+    supports_parallel_tool_calls: bool,
+    supports_search_tool: bool,
+    supported_in_api: bool,
+    visibility: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct ModelReasoningLevel {
+    effort: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+}
+
+#[derive(Serialize)]
 struct AccountStatus {
     name: String,
     path: String,
@@ -280,22 +329,42 @@ struct AccountStatus {
     disabled_for_seconds: Option<i64>,
     last_error: Option<String>,
     quota: Option<QuotaSnapshot>,
+    codex_usage: Option<CodexUsageSnapshot>,
+}
+
+#[derive(Serialize, Debug, Clone)]
+struct CodexUsageSnapshot {
+    observed_at: String,
+    source: String,
+    reset_credits: Option<Value>,
+    rate_limits: Option<Value>,
+    error: Option<String>,
 }
 
 struct ProxyServer {
     client: Client,
     account_pool: Arc<Mutex<AccountPool>>,
+    codex_usage_cache: Arc<Mutex<BTreeMap<String, CachedCodexUsage>>>,
     proxy_bearer_token: Option<String>,
     responses_api_key: Option<String>,
     debug_logs: bool,
     quota_probe_interval: Duration,
     quota_probe_model: String,
     quota_probe_input: String,
+    upstream_timeout: Duration,
+    codex_usage_cache_ttl: Duration,
+}
+
+#[derive(Debug, Clone)]
+struct CachedCodexUsage {
+    fetched_at: Instant,
+    snapshot: CodexUsageSnapshot,
 }
 
 const TOKEN_REFRESH_THRESHOLD: Duration = Duration::from_secs(300);
 const TOKEN_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const CHATGPT_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const CODEX_MODELS_CLIENT_VERSION: &str = "1.0.0";
 const DEFAULT_CODEX_INSTRUCTIONS: &str = "You are a helpful assistant.";
 const CHAT_MODEL_CANDIDATES: &[&str] = &["gpt-4", "gpt-5", "gpt-5.4"];
 const EMBEDDING_MODEL_CANDIDATES: &[&str] = &["text-embedding-3-small", "text-embedding-3-large"];
@@ -396,6 +465,43 @@ struct QuotaSnapshot {
     credits_unlimited: Option<bool>,
     credits_balance: Option<String>,
     raw_limit_name: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct CodexModelsResponse {
+    #[serde(default)]
+    models: Vec<CodexModel>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct CodexModel {
+    slug: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    input_modalities: Vec<String>,
+    #[serde(default)]
+    context_window: Option<u64>,
+    #[serde(default)]
+    max_context_window: Option<u64>,
+    #[serde(default)]
+    default_reasoning_level: Option<String>,
+    #[serde(default)]
+    supported_reasoning_levels: Vec<ModelReasoningLevel>,
+    #[serde(default)]
+    default_verbosity: Option<String>,
+    #[serde(default)]
+    support_verbosity: bool,
+    #[serde(default)]
+    supports_parallel_tool_calls: bool,
+    #[serde(default)]
+    supports_search_tool: bool,
+    #[serde(default)]
+    supported_in_api: bool,
+    #[serde(default = "default_model_visibility")]
+    visibility: String,
 }
 
 impl AttemptError {
@@ -757,6 +863,7 @@ impl AccountPool {
                         .filter(|seconds| *seconds > 0),
                     last_error: account.last_error.clone(),
                     quota: account.quota.clone(),
+                    codex_usage: None,
                 }
             })
             .collect::<Vec<_>>();
@@ -839,6 +946,8 @@ impl ProxyServer {
         quota_probe_interval: Duration,
         quota_probe_model: String,
         quota_probe_input: String,
+        upstream_timeout: Duration,
+        codex_usage_cache_ttl: Duration,
     ) -> Result<Self> {
         let client = Client::builder()
             .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
@@ -849,12 +958,15 @@ impl ProxyServer {
         let server = Self {
             client,
             account_pool: Arc::new(Mutex::new(account_pool)),
+            codex_usage_cache: Arc::new(Mutex::new(BTreeMap::new())),
             proxy_bearer_token,
             responses_api_key,
             debug_logs,
             quota_probe_interval,
             quota_probe_model,
             quota_probe_input,
+            upstream_timeout,
+            codex_usage_cache_ttl,
         };
         server.spawn_refresh_loop();
         Ok(server)
@@ -865,7 +977,24 @@ impl ProxyServer {
     }
 
     async fn status(&self) -> StatusResponse {
-        self.account_pool.lock().await.status()
+        let mut status = self.account_pool.lock().await.status();
+        let accounts = {
+            let pool = self.account_pool.lock().await;
+            pool.probe_targets()
+        };
+
+        for account in accounts {
+            let usage = self.cached_codex_usage_for_account(&account).await;
+            if let Some(account_status) = status
+                .accounts
+                .iter_mut()
+                .find(|candidate| candidate.name == account.name)
+            {
+                account_status.codex_usage = Some(usage);
+            }
+        }
+
+        status
     }
 
     async fn proxy_request(
@@ -881,8 +1010,11 @@ impl ProxyServer {
         chat_req: ChatCompletionsRequest,
     ) -> Result<warp::reply::Response> {
         let requested_model = chat_req.model.clone();
-        let response = self.execute_backend_stream_request(chat_req).await?;
-        Ok(chat_stream_response(requested_model, response))
+        let backend = self.execute_backend_request(chat_req).await?;
+        Ok(synthetic_chat_stream_response(
+            requested_model,
+            backend.summary,
+        ))
     }
 
     async fn proxy_embeddings_request(&self, embedding_req: Value) -> Result<Value> {
@@ -898,9 +1030,78 @@ impl ProxyServer {
         Ok(backend.body)
     }
 
-    async fn proxy_models_request(&self) -> Result<Value> {
-        let backend = self.execute_models_request().await?;
-        Ok(backend)
+    async fn proxy_models_request(&self) -> Result<ModelsApiResponse> {
+        self.execute_models_request().await
+    }
+
+    async fn dashboard_models(&self) -> Result<Vec<ModelsApiEntry>> {
+        Ok(self.execute_models_request().await?.data)
+    }
+
+    async fn cached_codex_usage_for_account(
+        &self,
+        account: &AccountProbeTarget,
+    ) -> CodexUsageSnapshot {
+        let cache_key = account.name.clone();
+        if let Some(cached) = self.codex_usage_cache.lock().await.get(&cache_key).cloned() {
+            if cached.fetched_at.elapsed() < self.codex_usage_cache_ttl {
+                return cached.snapshot;
+            }
+        }
+
+        let usage = match self.fetch_codex_usage_for_account(account).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => CodexUsageSnapshot {
+                observed_at: Utc::now().to_rfc3339(),
+                source: "https://chatgpt.com/api/codex/usage".to_string(),
+                reset_credits: None,
+                rate_limits: None,
+                error: Some(error.to_string()),
+            },
+        };
+
+        self.codex_usage_cache.lock().await.insert(
+            cache_key,
+            CachedCodexUsage {
+                fetched_at: Instant::now(),
+                snapshot: usage.clone(),
+            },
+        );
+
+        usage
+    }
+
+    async fn fetch_codex_usage_for_account(
+        &self,
+        account: &AccountProbeTarget,
+    ) -> Result<CodexUsageSnapshot> {
+        let lease = AccountLease {
+            index: account.index,
+            name: account.name.clone(),
+            auth_data: account.auth_data.clone(),
+        };
+
+        if let Err(error) = self.ensure_account_fresh(&lease).await {
+            eprintln!("Refresh check failed for {}: {}", lease.name, error);
+        }
+
+        let lease = {
+            let pool = self.account_pool.lock().await;
+            let Some((name, _, auth_data)) = pool.auth_snapshot(account.index) else {
+                bail!("Account {} disappeared before usage fetch", account.name);
+            };
+            AccountLease {
+                index: account.index,
+                name,
+                auth_data,
+            }
+        };
+
+        let body = self
+            .send_codex_usage_request(&lease)
+            .await
+            .map_err(|error| anyhow!(error.message))?;
+        Ok(codex_usage_snapshot_from_value(body))
     }
 
     async fn model_status(&self) -> Result<ModelStatusResponse> {
@@ -1063,128 +1264,6 @@ impl ProxyServer {
 
         Err(anyhow!(
             "All configured accounts failed. Last error: {}",
-            last_retryable_error.unwrap_or_else(|| "unknown upstream failure".to_string())
-        ))
-    }
-
-    async fn execute_backend_stream_request(
-        &self,
-        chat_req: ChatCompletionsRequest,
-    ) -> Result<reqwest::Response> {
-        let total_accounts = self.account_pool.lock().await.accounts.len();
-        let mut last_retryable_error = None;
-
-        for _ in 0..total_accounts {
-            let lease = {
-                let mut pool = self.account_pool.lock().await;
-                pool.lease_next_account()?
-            };
-
-            if let Err(error) = self.ensure_account_fresh(&lease).await {
-                eprintln!("Refresh check failed for {}: {}", lease.name, error);
-            }
-            let effective_lease = {
-                let pool = self.account_pool.lock().await;
-                let Some((name, _, auth_data)) = pool.auth_snapshot(lease.index) else {
-                    return Err(anyhow!("Account disappeared before stream dispatch"));
-                };
-                AccountLease {
-                    index: lease.index,
-                    name,
-                    auth_data,
-                }
-            };
-            log_request(
-                "POST",
-                "/backend-api/codex/responses",
-                Some(&effective_lease.name),
-            );
-            self.debug_log_chat_request(&chat_req);
-
-            match self
-                .send_backend_stream_request(&effective_lease, &chat_req)
-                .await
-            {
-                Ok(response) => {
-                    self.account_pool
-                        .lock()
-                        .await
-                        .mark_success(effective_lease.index);
-                    return Ok(response);
-                }
-                Err(error) if error.auth_failed => {
-                    match self.refresh_account(effective_lease.index, true).await {
-                        Ok(_) => {
-                            let refreshed_lease = {
-                                let pool = self.account_pool.lock().await;
-                                let Some((name, _, auth_data)) =
-                                    pool.auth_snapshot(effective_lease.index)
-                                else {
-                                    return Err(anyhow!(
-                                        "Account disappeared during stream refresh"
-                                    ));
-                                };
-                                AccountLease {
-                                    index: effective_lease.index,
-                                    name,
-                                    auth_data,
-                                }
-                            };
-                            match self
-                                .send_backend_stream_request(&refreshed_lease, &chat_req)
-                                .await
-                            {
-                                Ok(response) => {
-                                    self.account_pool
-                                        .lock()
-                                        .await
-                                        .mark_success(refreshed_lease.index);
-                                    return Ok(response);
-                                }
-                                Err(retry_error) if retry_error.retryable => {
-                                    eprintln!(
-                                        "Retryable upstream stream failure on {} after refresh: {}",
-                                        refreshed_lease.name, retry_error.message
-                                    );
-                                    self.account_pool.lock().await.mark_failure(
-                                        refreshed_lease.index,
-                                        retry_error.message.clone(),
-                                    );
-                                    last_retryable_error = Some(retry_error.message);
-                                }
-                                Err(retry_error) => return Err(anyhow!(retry_error.message)),
-                            }
-                        }
-                        Err(refresh_error) => {
-                            eprintln!(
-                                "Forced refresh failed for {}: {}",
-                                effective_lease.name, refresh_error
-                            );
-                            self.account_pool
-                                .lock()
-                                .await
-                                .mark_failure(effective_lease.index, error.message.clone());
-                            last_retryable_error = Some(error.message);
-                        }
-                    }
-                }
-                Err(error) if error.retryable => {
-                    eprintln!(
-                        "Retryable upstream stream failure on {}: {}",
-                        effective_lease.name, error.message
-                    );
-                    self.account_pool
-                        .lock()
-                        .await
-                        .mark_failure(effective_lease.index, error.message.clone());
-                    last_retryable_error = Some(error.message);
-                }
-                Err(error) => return Err(anyhow!(error.message)),
-            }
-        }
-
-        Err(anyhow!(
-            "All configured accounts failed. Last stream error: {}",
             last_retryable_error.unwrap_or_else(|| "unknown upstream failure".to_string())
         ))
     }
@@ -1477,7 +1556,7 @@ impl ProxyServer {
         )))
     }
 
-    async fn execute_models_request(&self) -> Result<Value> {
+    async fn execute_models_request(&self) -> Result<ModelsApiResponse> {
         let total_accounts = self.account_pool.lock().await.accounts.len();
         let mut last_error = None;
 
@@ -1503,13 +1582,13 @@ impl ProxyServer {
                 }
             };
 
-            match self.send_models_request(&effective_lease).await {
+            match self.send_codex_models_request(&effective_lease).await {
                 Ok(response) => {
                     self.account_pool
                         .lock()
                         .await
                         .mark_success(effective_lease.index);
-                    return Ok(response);
+                    return Ok(build_models_api_response(response.models));
                 }
                 Err(error) if error.auth_failed => {
                     if let Err(refresh_error) =
@@ -1553,6 +1632,7 @@ impl ProxyServer {
                 responses_req.input.len()
             );
         }
+        let started_at = Instant::now();
         let mut request_builder = self
             .client
             .post("https://chatgpt.com/backend-api/codex/responses")
@@ -1570,7 +1650,8 @@ impl ProxyServer {
             .header("DNT", "1")
             .header("OpenAI-Beta", "responses=experimental")
             .header("originator", "codex_cli_rs")
-            .header("session_id", Uuid::new_v4().to_string());
+            .header("session_id", Uuid::new_v4().to_string())
+            .timeout(self.upstream_timeout);
 
         if let Some(tokens) = &lease.auth_data.tokens {
             request_builder = request_builder
@@ -1590,12 +1671,22 @@ impl ProxyServer {
             .json(&responses_req)
             .send()
             .await
-            .map_err(|error| AttemptError::retryable(format!("Network error: {}", error)))?;
+            .map_err(|error| {
+                AttemptError::retryable(format!(
+                    "Network error after {} ms: {}",
+                    started_at.elapsed().as_millis(),
+                    error
+                ))
+            })?;
 
         let status = response.status();
         let quota = quota_from_headers(response.headers());
         let body = response.text().await.map_err(|error| {
-            AttemptError::retryable(format!("Failed to read upstream response: {}", error))
+            AttemptError::retryable(format!(
+                "Failed to read upstream response after {} ms: {}",
+                started_at.elapsed().as_millis(),
+                error
+            ))
         })?;
 
         if let Some(quota) = quota {
@@ -1638,8 +1729,9 @@ impl ProxyServer {
         })?;
         if self.debug_logs {
             println!(
-                "DEBUG upstream success: response_id={:?}, text_preview={}",
+                "DEBUG upstream success: response_id={:?}, elapsed_ms={}, text_preview={}",
                 summary.response_id,
+                started_at.elapsed().as_millis(),
                 preview_text(&summary.text, 180)
             );
         }
@@ -1648,102 +1740,6 @@ impl ProxyServer {
             model: chat_req.model.clone(),
             summary,
         })
-    }
-
-    async fn send_backend_stream_request(
-        &self,
-        lease: &AccountLease,
-        chat_req: &ChatCompletionsRequest,
-    ) -> std::result::Result<reqwest::Response, AttemptError> {
-        let responses_req = self.convert_chat_to_responses(chat_req);
-        if self.debug_logs {
-            println!(
-                "DEBUG upstream stream request: account={}, model={}, input_messages={}",
-                lease.name,
-                responses_req.model,
-                responses_req.input.len()
-            );
-        }
-        let mut request_builder = self
-            .client
-            .post("https://chatgpt.com/backend-api/codex/responses")
-            .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream")
-            .header("Accept-Language", "en-US,en;q=0.9")
-            .header("Accept-Encoding", "gzip, deflate, br")
-            .header("Referer", "https://chatgpt.com/")
-            .header("Origin", "https://chatgpt.com")
-            .header("Sec-Fetch-Dest", "empty")
-            .header("Sec-Fetch-Mode", "cors")
-            .header("Sec-Fetch-Site", "same-origin")
-            .header("Cache-Control", "no-cache")
-            .header("Pragma", "no-cache")
-            .header("DNT", "1")
-            .header("OpenAI-Beta", "responses=experimental")
-            .header("originator", "codex_cli_rs")
-            .header("session_id", Uuid::new_v4().to_string());
-
-        if let Some(tokens) = &lease.auth_data.tokens {
-            request_builder = request_builder
-                .header("Authorization", format!("Bearer {}", tokens.access_token))
-                .header("chatgpt-account-id", &tokens.account_id);
-        } else if let Some(api_key) = &lease.auth_data.api_key {
-            request_builder =
-                request_builder.header("Authorization", format!("Bearer {}", api_key));
-        } else {
-            return Err(AttemptError::fatal(format!(
-                "{} does not have usable authentication data",
-                lease.name
-            )));
-        }
-
-        let response = request_builder
-            .json(&responses_req)
-            .send()
-            .await
-            .map_err(|error| AttemptError::retryable(format!("Network error: {}", error)))?;
-
-        let status = response.status();
-        let quota = quota_from_headers(response.headers());
-        if let Some(quota) = quota {
-            self.account_pool
-                .lock()
-                .await
-                .update_quota(lease.index, quota);
-        }
-
-        if !status.is_success() {
-            let body = response.text().await.map_err(|error| {
-                AttemptError::retryable(format!("Failed to read upstream response: {}", error))
-            })?;
-            let summary = summarize_body(&body);
-            if self.debug_logs {
-                println!(
-                    "DEBUG upstream stream error: status={}, body={}",
-                    status,
-                    preview_text(&body, 800)
-                );
-            }
-            if status.as_u16() == 401 || status.as_u16() == 403 {
-                return Err(AttemptError::auth_retryable(format!(
-                    "Upstream stream status {} for {}: {}",
-                    status, lease.name, summary
-                )));
-            }
-            if status.is_server_error() || status.as_u16() == 429 {
-                return Err(AttemptError::retryable(format!(
-                    "Upstream stream status {} for {}: {}",
-                    status, lease.name, summary
-                )));
-            }
-
-            return Err(AttemptError::fatal(format!(
-                "Upstream stream status {}: {}",
-                status, summary
-            )));
-        }
-
-        Ok(response)
     }
 
     async fn send_embeddings_request(
@@ -1837,15 +1833,30 @@ impl ProxyServer {
         Ok(EmbeddingsResponse { body })
     }
 
-    async fn send_models_request(
+    async fn send_codex_models_request(
         &self,
         lease: &AccountLease,
-    ) -> std::result::Result<Value, AttemptError> {
-        let mut request_builder = self.client.get("https://api.openai.com/v1/models");
+    ) -> std::result::Result<CodexModelsResponse, AttemptError> {
+        let mut request_builder = self
+            .client
+            .get("https://chatgpt.com/backend-api/codex/models")
+            .query(&[("client_version", CODEX_MODELS_CLIENT_VERSION)])
+            .header("Accept", "application/json")
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Referer", "https://chatgpt.com/")
+            .header("Origin", "https://chatgpt.com")
+            .header("Sec-Fetch-Dest", "empty")
+            .header("Sec-Fetch-Mode", "cors")
+            .header("Sec-Fetch-Site", "same-origin")
+            .header("Cache-Control", "no-cache")
+            .header("Pragma", "no-cache")
+            .header("DNT", "1")
+            .timeout(self.upstream_timeout);
 
         if let Some(tokens) = &lease.auth_data.tokens {
-            request_builder =
-                request_builder.header("Authorization", format!("Bearer {}", tokens.access_token));
+            request_builder = request_builder
+                .header("Authorization", format!("Bearer {}", tokens.access_token))
+                .header("chatgpt-account-id", &tokens.account_id);
         } else if let Some(api_key) = &lease.auth_data.api_key {
             request_builder =
                 request_builder.header("Authorization", format!("Bearer {}", api_key));
@@ -1886,8 +1897,61 @@ impl ProxyServer {
             )));
         }
 
-        serde_json::from_str::<Value>(&body_text)
+        serde_json::from_str::<CodexModelsResponse>(&body_text)
             .map_err(|error| AttemptError::fatal(format!("Invalid models JSON: {}", error)))
+    }
+
+    async fn send_codex_usage_request(
+        &self,
+        lease: &AccountLease,
+    ) -> std::result::Result<Value, AttemptError> {
+        let mut request_builder = self
+            .client
+            .get("https://chatgpt.com/api/codex/usage")
+            .header("Accept", "application/json")
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Referer", "https://chatgpt.com/codex/settings/usage")
+            .header("Origin", "https://chatgpt.com")
+            .header("Sec-Fetch-Dest", "empty")
+            .header("Sec-Fetch-Mode", "cors")
+            .header("Sec-Fetch-Site", "same-origin")
+            .header("Cache-Control", "no-cache")
+            .header("Pragma", "no-cache")
+            .header("DNT", "1")
+            .timeout(self.upstream_timeout.min(Duration::from_secs(5)));
+
+        if let Some(tokens) = &lease.auth_data.tokens {
+            request_builder = request_builder
+                .header("Authorization", format!("Bearer {}", tokens.access_token))
+                .header("chatgpt-account-id", &tokens.account_id);
+        } else {
+            return Err(AttemptError::fatal(format!(
+                "{} does not have ChatGPT token authentication for Codex usage",
+                lease.name
+            )));
+        }
+
+        let response = request_builder
+            .send()
+            .await
+            .map_err(|error| AttemptError::retryable(format!("Usage network error: {}", error)))?;
+
+        let status = response.status();
+        let body_text = response.text().await.map_err(|error| {
+            AttemptError::retryable(format!("Failed to read usage response: {}", error))
+        })?;
+
+        if !status.is_success() {
+            return Err(AttemptError::retryable(format!(
+                "Usage upstream status {} for {}: {}",
+                status,
+                lease.name,
+                summarize_body(&body_text)
+            )));
+        }
+
+        serde_json::from_str::<Value>(&body_text)
+            .map_err(|error| AttemptError::fatal(format!("Invalid usage JSON: {}", error)))
     }
 
     async fn send_responses_request(
@@ -1895,11 +1959,13 @@ impl ProxyServer {
         lease: &AccountLease,
         responses_req: &Value,
     ) -> std::result::Result<ResponsesApiResponse, AttemptError> {
+        let started_at = Instant::now();
         let mut request_builder = self
             .client
             .post("https://api.openai.com/v1/responses")
             .header("Content-Type", "application/json")
-            .header("Accept", "application/json");
+            .header("Accept", "application/json")
+            .timeout(self.upstream_timeout);
 
         if let Some(api_key) = &self.responses_api_key {
             request_builder =
@@ -1921,12 +1987,22 @@ impl ProxyServer {
             .json(responses_req)
             .send()
             .await
-            .map_err(|error| AttemptError::retryable(format!("Network error: {}", error)))?;
+            .map_err(|error| {
+                AttemptError::retryable(format!(
+                    "Network error after {} ms: {}",
+                    started_at.elapsed().as_millis(),
+                    error
+                ))
+            })?;
 
         let status = response.status();
         let quota = quota_from_headers(response.headers());
         let body_text = response.text().await.map_err(|error| {
-            AttemptError::retryable(format!("Failed to read upstream response: {}", error))
+            AttemptError::retryable(format!(
+                "Failed to read upstream response after {} ms: {}",
+                started_at.elapsed().as_millis(),
+                error
+            ))
         })?;
 
         if let Some(quota) = quota {
@@ -1986,8 +2062,10 @@ impl ProxyServer {
                 })
                 .unwrap_or_else(|| "no text".to_string());
             println!(
-                "DEBUG responses upstream success: response_id={}, text_preview={}",
-                response_id, output_text
+                "DEBUG responses upstream success: response_id={}, elapsed_ms={}, text_preview={}",
+                response_id,
+                started_at.elapsed().as_millis(),
+                output_text
             );
         }
 
@@ -2001,20 +2079,14 @@ impl ProxyServer {
             auth_data: account.auth_data.clone(),
         };
         let body = self
-            .send_models_request(&lease)
+            .send_codex_models_request(&lease)
             .await
             .map_err(|error| anyhow!(error.message))?;
         let mut ids = body
-            .get("data")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.get("id").and_then(Value::as_str))
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+            .models
+            .into_iter()
+            .map(|model| model.slug)
+            .collect::<Vec<_>>();
         ids.sort();
         Ok(ids)
     }
@@ -3031,38 +3103,17 @@ fn translate_to_chat_sse(requested_model: &str, summary: BackendEventSummary) ->
     chunks.join("")
 }
 
-fn chat_stream_response(
+fn synthetic_chat_stream_response(
     requested_model: String,
-    upstream: reqwest::Response,
+    summary: BackendEventSummary,
 ) -> warp::reply::Response {
-    let created = Utc::now().timestamp();
-    let mut buffer = String::new();
-    let mut translator = SseChatTranslator::new(requested_model, created);
-    let stream = upstream.bytes_stream().map(move |chunk| {
-        let mut output = String::new();
-        match chunk {
-            Ok(bytes) => {
-                buffer.push_str(&String::from_utf8_lossy(&bytes));
-                while let Some(frame_end) = buffer.find("\n\n") {
-                    let frame = buffer[..frame_end].to_string();
-                    buffer = buffer[frame_end + 2..].to_string();
-                    output.push_str(&translator.translate_frame(&frame));
-                }
-            }
-            Err(error) => {
-                output.push_str(&translator.translate_error(&error.to_string()));
-            }
-        }
-
-        Ok::<_, Infallible>(bytes::Bytes::from(output))
-    });
-
+    let stream = translate_to_chat_sse(&requested_model, summary);
     warp::http::Response::builder()
         .header("content-type", "text/event-stream")
         .header("cache-control", "no-cache")
         .header("connection", "keep-alive")
         .header("access-control-allow-origin", "*")
-        .body(warp::hyper::Body::wrap_stream(stream))
+        .body(warp::hyper::Body::from(stream))
         .unwrap_or_else(|_| {
             warp::reply::with_status(
                 "Failed to create stream response",
@@ -3070,303 +3121,6 @@ fn chat_stream_response(
             )
             .into_response()
         })
-}
-
-struct SseChatTranslator {
-    chunk_id: Option<String>,
-    requested_model: String,
-    created: i64,
-    role_sent: bool,
-    finished: bool,
-    saw_text_delta: bool,
-    emitted_tool_call: bool,
-    tool_call_builders: BTreeMap<usize, ToolCallBuilder>,
-    tool_call_ids: BTreeMap<String, usize>,
-    announced_tool_calls: BTreeMap<usize, bool>,
-    next_tool_index: usize,
-}
-
-impl SseChatTranslator {
-    fn new(requested_model: String, created: i64) -> Self {
-        Self {
-            chunk_id: None,
-            requested_model,
-            created,
-            role_sent: false,
-            finished: false,
-            saw_text_delta: false,
-            emitted_tool_call: false,
-            tool_call_builders: BTreeMap::new(),
-            tool_call_ids: BTreeMap::new(),
-            announced_tool_calls: BTreeMap::new(),
-            next_tool_index: 0,
-        }
-    }
-
-    fn translate_frame(&mut self, frame: &str) -> String {
-        if self.finished {
-            return String::new();
-        }
-
-        let payload = frame
-            .lines()
-            .filter_map(|line| line.strip_prefix("data: "))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        if payload.is_empty() {
-            return String::new();
-        }
-        if payload == "[DONE]" {
-            return self.finish();
-        }
-
-        let Ok(event) = serde_json::from_str::<Value>(&payload) else {
-            return String::new();
-        };
-        self.capture_response_id(&event);
-
-        let mut output = String::new();
-        match event.get("type").and_then(Value::as_str) {
-            Some("response.output_text.delta") => {
-                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
-                    self.saw_text_delta = true;
-                    output.push_str(&self.ensure_role_chunk());
-                    output.push_str(&self.content_chunk(delta));
-                }
-            }
-            Some("response.output_item.added") | Some("response.output_item.done") => {
-                if let Some(item) = event.get("item") {
-                    if item.get("type").and_then(Value::as_str) == Some("function_call") {
-                        let index = tool_call_index_for_item(
-                            &event,
-                            item,
-                            &mut self.tool_call_ids,
-                            &mut self.next_tool_index,
-                        );
-                        let builder = self.tool_call_builders.entry(index).or_default();
-                        apply_function_call_item(builder, item);
-                        output.push_str(&self.announce_tool_call(index));
-                    } else if !self.saw_text_delta
-                        && event.get("type").and_then(Value::as_str)
-                            == Some("response.output_item.done")
-                    {
-                        output.push_str(&self.emit_item_text(item));
-                    }
-                }
-            }
-            Some("response.function_call_arguments.delta") => {
-                let index = tool_call_index_for_event(
-                    &event,
-                    &mut self.tool_call_ids,
-                    &mut self.next_tool_index,
-                );
-                let delta = event
-                    .get("delta")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                self.tool_call_builders
-                    .entry(index)
-                    .or_default()
-                    .arguments
-                    .push_str(&delta);
-                output.push_str(&self.ensure_role_chunk());
-                if !self.announced_tool_calls.contains_key(&index) {
-                    output.push_str(&self.announce_tool_call(index));
-                } else if !delta.is_empty() {
-                    self.emitted_tool_call = true;
-                    output.push_str(&self.tool_arguments_chunk(index, &delta));
-                }
-            }
-            Some("response.function_call_arguments.done") => {
-                let index = tool_call_index_for_event(
-                    &event,
-                    &mut self.tool_call_ids,
-                    &mut self.next_tool_index,
-                );
-                if let Some(arguments) = event.get("arguments").and_then(Value::as_str) {
-                    self.tool_call_builders.entry(index).or_default().arguments =
-                        arguments.to_string();
-                }
-                output.push_str(&self.ensure_role_chunk());
-                output.push_str(&self.announce_tool_call(index));
-            }
-            Some("response.completed") => {
-                output.push_str(&self.emit_completed_fallbacks(&event));
-                output.push_str(&self.finish());
-            }
-            _ => {}
-        }
-
-        output
-    }
-
-    fn translate_error(&mut self, message: &str) -> String {
-        if self.finished {
-            return String::new();
-        }
-        let mut output = self.ensure_role_chunk();
-        output.push_str(&self.content_chunk(&format!("Proxy stream error: {}", message)));
-        output.push_str(&self.finish());
-        output
-    }
-
-    fn capture_response_id(&mut self, event: &Value) {
-        if self.chunk_id.is_some() {
-            return;
-        }
-        self.chunk_id = event
-            .get("response")
-            .and_then(|response| response.get("id"))
-            .and_then(Value::as_str)
-            .or_else(|| event.get("id").and_then(Value::as_str))
-            .map(ToString::to_string);
-    }
-
-    fn chunk_id(&self) -> String {
-        self.chunk_id
-            .clone()
-            .unwrap_or_else(|| format!("chatcmpl-{}", Uuid::new_v4()))
-    }
-
-    fn ensure_role_chunk(&mut self) -> String {
-        if self.role_sent {
-            return String::new();
-        }
-        self.role_sent = true;
-        self.chat_chunk(json!({"role": "assistant"}), None)
-    }
-
-    fn content_chunk(&self, content: &str) -> String {
-        self.chat_chunk(json!({"content": content}), None)
-    }
-
-    fn announce_tool_call(&mut self, index: usize) -> String {
-        if self.announced_tool_calls.contains_key(&index) {
-            return String::new();
-        }
-
-        let Some(builder) = self.tool_call_builders.get(&index) else {
-            return String::new();
-        };
-        let Some(name) = &builder.name else {
-            return String::new();
-        };
-        let id = builder
-            .id
-            .clone()
-            .unwrap_or_else(|| format!("call_{}", Uuid::new_v4()));
-        let name = name.clone();
-
-        self.announced_tool_calls.insert(index, true);
-        self.emitted_tool_call = true;
-        self.ensure_role_chunk()
-            + &self.chat_chunk(
-                json!({
-                    "tool_calls": [{
-                        "index": index,
-                        "id": id,
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": ""
-                        }
-                    }]
-                }),
-                None,
-            )
-    }
-
-    fn tool_arguments_chunk(&self, index: usize, arguments: &str) -> String {
-        self.chat_chunk(
-            json!({
-                "tool_calls": [{
-                    "index": index,
-                    "function": {
-                        "arguments": arguments
-                    }
-                }]
-            }),
-            None,
-        )
-    }
-
-    fn emit_item_text(&mut self, item: &Value) -> String {
-        let mut output = String::new();
-        if let Some(content) = item.get("content").and_then(Value::as_array) {
-            for part in content {
-                if let Some(text) = part.get("text").and_then(Value::as_str) {
-                    output.push_str(&self.ensure_role_chunk());
-                    output.push_str(&self.content_chunk(text));
-                }
-            }
-        }
-        output
-    }
-
-    fn emit_completed_fallbacks(&mut self, event: &Value) -> String {
-        let mut output = String::new();
-        let Some(items) = event
-            .get("response")
-            .and_then(|response| response.get("output"))
-            .and_then(Value::as_array)
-        else {
-            return output;
-        };
-
-        for (output_index, item) in items.iter().enumerate() {
-            if item.get("type").and_then(Value::as_str) == Some("function_call") {
-                let index = tool_call_index_for_item_with_fallback(
-                    item,
-                    output_index,
-                    &mut self.tool_call_ids,
-                );
-                let builder = self.tool_call_builders.entry(index).or_default();
-                apply_function_call_item(builder, item);
-                output.push_str(&self.announce_tool_call(index));
-            } else if !self.saw_text_delta {
-                output.push_str(&self.emit_item_text(item));
-            }
-        }
-
-        output
-    }
-
-    fn finish(&mut self) -> String {
-        if self.finished {
-            return String::new();
-        }
-        self.finished = true;
-        let mut output = self.ensure_role_chunk();
-        output.push_str(&self.chat_chunk(
-            json!({}),
-            Some(if self.emitted_tool_call {
-                "tool_calls"
-            } else {
-                "stop"
-            }),
-        ));
-        output.push_str("data: [DONE]\n\n");
-        output
-    }
-
-    fn chat_chunk(&self, delta: Value, finish_reason: Option<&str>) -> String {
-        format!(
-            "data: {}\n\n",
-            json!({
-                "id": self.chunk_id(),
-                "object": "chat.completion.chunk",
-                "created": self.created,
-                "model": self.requested_model,
-                "choices": [{
-                    "index": 0,
-                    "delta": delta,
-                    "finish_reason": finish_reason
-                }]
-            })
-        )
-    }
 }
 
 fn summarize_body(body: &str) -> String {
@@ -3490,7 +3244,188 @@ fn is_public_proxy_route(method: &warp::http::Method, path: &str) -> bool {
     )
 }
 
-fn render_dashboard(status: &StatusResponse) -> String {
+fn default_model_visibility() -> String {
+    "list".to_string()
+}
+
+fn build_models_api_response(models: Vec<CodexModel>) -> ModelsApiResponse {
+    let mut entries = models
+        .into_iter()
+        .filter(|model| model.supported_in_api && model.visibility != "hide")
+        .map(|model| ModelsApiEntry {
+            id: model.slug,
+            object: "model",
+            created: 0,
+            owned_by: "openai",
+            display_name: model.display_name,
+            description: model.description,
+            input_modalities: model.input_modalities,
+            context_window: model.context_window,
+            max_context_window: model.max_context_window,
+            default_reasoning_level: model.default_reasoning_level,
+            supported_reasoning_levels: model.supported_reasoning_levels,
+            default_verbosity: model.default_verbosity,
+            support_verbosity: model.support_verbosity,
+            supports_parallel_tool_calls: model.supports_parallel_tool_calls,
+            supports_search_tool: model.supports_search_tool,
+            supported_in_api: model.supported_in_api,
+            visibility: model.visibility,
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.id.cmp(&right.id));
+
+    ModelsApiResponse {
+        object: "list",
+        data: entries,
+    }
+}
+
+fn codex_usage_snapshot_from_value(body: Value) -> CodexUsageSnapshot {
+    let reset_credits = find_usage_field(
+        &body,
+        &[
+            "rateLimitResetCredits",
+            "rate_limit_reset_credits",
+            "rateLimitResetCreditsSummary",
+            "rate_limit_reset_credits_summary",
+            "resetCredits",
+            "reset_credits",
+        ],
+    )
+    .cloned();
+    let rate_limits = find_usage_field(
+        &body,
+        &[
+            "rateLimits",
+            "rate_limits",
+            "rateLimitsByLimitId",
+            "rate_limits_by_limit_id",
+        ],
+    )
+    .cloned();
+
+    CodexUsageSnapshot {
+        observed_at: Utc::now().to_rfc3339(),
+        source: "https://chatgpt.com/api/codex/usage".to_string(),
+        reset_credits,
+        rate_limits,
+        error: None,
+    }
+}
+
+fn find_usage_field<'a>(value: &'a Value, names: &[&str]) -> Option<&'a Value> {
+    match value {
+        Value::Object(map) => {
+            for name in names {
+                if let Some(found) = map.get(*name) {
+                    return Some(found);
+                }
+            }
+            map.values()
+                .find_map(|child| find_usage_field(child, names))
+        }
+        Value::Array(items) => items
+            .iter()
+            .find_map(|child| find_usage_field(child, names)),
+        _ => None,
+    }
+}
+
+fn render_reset_credits_summary(usage: Option<&CodexUsageSnapshot>) -> String {
+    let Some(usage) = usage else {
+        return "not checked".to_string();
+    };
+    if let Some(error) = &usage.error {
+        return format!("unavailable: {}", summarize_body(error));
+    }
+    let Some(reset_credits) = &usage.reset_credits else {
+        return "not advertised".to_string();
+    };
+    format_usage_value(reset_credits)
+}
+
+fn format_usage_value(value: &Value) -> String {
+    match value {
+        Value::Null => "n/a".to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => value.clone(),
+        Value::Array(items) => {
+            if items.is_empty() {
+                "none".to_string()
+            } else if items.len() == 1 {
+                format_usage_value(&items[0])
+            } else {
+                format!("{} entries", items.len())
+            }
+        }
+        Value::Object(map) => {
+            let remaining = usage_object_field(
+                map,
+                &[
+                    "remaining",
+                    "remainingCount",
+                    "remaining_count",
+                    "available",
+                    "availableCount",
+                    "available_count",
+                    "count",
+                ],
+            );
+            let total = usage_object_field(map, &["total", "totalCount", "total_count", "limit"]);
+            let resets_at =
+                usage_object_field(map, &["resetsAt", "resets_at", "resetAt", "reset_at"]);
+
+            match (remaining, total, resets_at) {
+                (Some(remaining), Some(total), Some(resets_at)) => {
+                    format!(
+                        "{} of {} until {}",
+                        remaining,
+                        total,
+                        format_usage_reset_at(resets_at)
+                    )
+                }
+                (Some(remaining), Some(total), None) => format!("{} of {}", remaining, total),
+                (Some(remaining), None, Some(resets_at)) => {
+                    format!("{} until {}", remaining, format_usage_reset_at(resets_at))
+                }
+                (Some(remaining), None, None) => remaining,
+                _ => compact_json(value, 120),
+            }
+        }
+    }
+}
+
+fn usage_object_field(map: &serde_json::Map<String, Value>, names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| map.get(*name))
+        .map(format_usage_value)
+}
+
+fn format_usage_reset_at(value: String) -> String {
+    if let Ok(timestamp) = value.parse::<i64>() {
+        if let Some(datetime) = DateTime::<Utc>::from_timestamp(timestamp, 0) {
+            return format_relative_timestamp(&datetime.to_rfc3339());
+        }
+    }
+    value
+}
+
+fn compact_json(value: &Value, max_chars: usize) -> String {
+    let mut text = value.to_string();
+    if text.chars().count() > max_chars {
+        text = text.chars().take(max_chars).collect::<String>();
+        text.push_str("...");
+    }
+    text
+}
+
+fn render_dashboard(
+    status: &StatusResponse,
+    models: &[ModelsApiEntry],
+    models_error: Option<&str>,
+) -> String {
     let health_percent = percent(status.accounts_healthy, status.accounts_loaded);
     let generated = format_relative_timestamp(&status.generated_at);
     let next_account = status.next_account.as_deref().unwrap_or("n/a");
@@ -3500,6 +3435,44 @@ fn render_dashboard(status: &StatusResponse) -> String {
         .map(render_account_card)
         .collect::<Vec<_>>()
         .join("\n");
+    let model_cards = models
+        .iter()
+        .map(render_model_card)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let models_error_html = models_error
+        .map(|error| {
+            format!(
+                r#"<div class="error">Model list unavailable: {}</div>"#,
+                html_escape(error)
+            )
+        })
+        .unwrap_or_default();
+    let models_section = if model_cards.is_empty() {
+        if models_error_html.is_empty() {
+            r#"<div class="subtle">No Codex-backed models are currently visible for this account set.</div>"#
+                .to_string()
+        } else {
+            models_error_html
+        }
+    } else {
+        format!(
+            r#"<section class="section-head">
+      <div>
+        <h2>Models</h2>
+        <div class="subtle">Codex-auth catalog normalized into the local OpenAI-style <code>/models</code> response.</div>
+      </div>
+      <div class="subtle">{count} models</div>
+    </section>
+    {error}
+    <section class="grid" aria-label="Models">
+      {cards}
+    </section>"#,
+            count = models.len(),
+            error = models_error_html,
+            cards = model_cards
+        )
+    };
 
     format!(
         r#"<!doctype html>
@@ -3607,6 +3580,10 @@ fn render_dashboard(status: &StatusResponse) -> String {
       border-color: var(--accent);
       background: var(--accent);
     }}
+    code {{
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: .95em;
+    }}
     main {{
       padding: 28px 0 44px;
     }}
@@ -3695,6 +3672,19 @@ fn render_dashboard(status: &StatusResponse) -> String {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 18px;
+    }}
+    .section-head {{
+      margin: 26px 0 14px;
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }}
+    .section-head h2 {{
+      margin: 0 0 4px;
+      font-size: 18px;
+      line-height: 1.2;
     }}
     .card {{
       border: 1px solid var(--line);
@@ -3895,9 +3885,17 @@ fn render_dashboard(status: &StatusResponse) -> String {
         </div>
       </div>
     </section>
+    <section class="section-head">
+      <div>
+        <h2>Accounts</h2>
+        <div class="subtle">Rotating Codex auth files, refresh state, and observed quota headers.</div>
+      </div>
+      <div class="subtle">{loaded} configured</div>
+    </section>
     <section class="grid" aria-label="Accounts">
       {account_cards}
     </section>
+    {models_section}
     <div class="footer">
       <span>Service: {service}</span>
       <span>Generated at {generated_raw}</span>
@@ -3914,6 +3912,7 @@ fn render_dashboard(status: &StatusResponse) -> String {
         refresh_interval = status.refresh_interval_seconds,
         refresh_threshold = status.refresh_threshold_seconds,
         account_cards = account_cards,
+        models_section = models_section,
         service = html_escape(status.service),
     )
 }
@@ -3982,6 +3981,12 @@ fn render_account_card(account: &AccountStatus) -> String {
         .and_then(|quota| quota.secondary_reset_after_seconds)
         .map(|seconds| format_duration_seconds(Some(seconds as i64)))
         .unwrap_or_else(|| "n/a".to_string());
+    let usage_resets = render_reset_credits_summary(account.codex_usage.as_ref());
+    let usage_seen = account
+        .codex_usage
+        .as_ref()
+        .map(|usage| format_relative_timestamp(&usage.observed_at))
+        .unwrap_or_else(|| "never".to_string());
     let error = account
         .last_error
         .as_ref()
@@ -4015,6 +4020,8 @@ fn render_account_card(account: &AccountStatus) -> String {
       <div class="detail"><div class="k">Quota Seen</div><div class="v">{quota_seen}</div></div>
       <div class="detail"><div class="k">Primary Reset</div><div class="v">{primary_reset}</div></div>
       <div class="detail"><div class="k">Secondary Reset</div><div class="v">{secondary_reset}</div></div>
+      <div class="detail"><div class="k">Usage Resets</div><div class="v">{usage_resets}</div></div>
+      <div class="detail"><div class="k">Usage Seen</div><div class="v">{usage_seen}</div></div>
       <div class="detail"><div class="k">Access Token</div><div class="v">{access_remaining}</div></div>
       <div class="detail"><div class="k">ID Token</div><div class="v">{id_remaining}</div></div>
       <div class="detail"><div class="k">Refresh</div><div class="v"><span class="pill {refresh_class}">{refresh_text}</span></div></div>
@@ -4040,6 +4047,8 @@ fn render_account_card(account: &AccountStatus) -> String {
         quota_seen = html_escape(&quota_seen),
         primary_reset = html_escape(&primary_reset),
         secondary_reset = html_escape(&secondary_reset),
+        usage_resets = html_escape(&usage_resets),
+        usage_seen = html_escape(&usage_seen),
         access_remaining = html_escape(&access_remaining),
         id_remaining = html_escape(&id_remaining),
         refresh_class = refresh_class,
@@ -4052,12 +4061,88 @@ fn render_account_card(account: &AccountStatus) -> String {
     )
 }
 
+fn render_model_card(model: &ModelsApiEntry) -> String {
+    let reasoning = if model.supported_reasoning_levels.is_empty() {
+        "n/a".to_string()
+    } else {
+        model
+            .supported_reasoning_levels
+            .iter()
+            .map(|level| level.effort.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let think_default = model.default_reasoning_level.as_deref().unwrap_or("n/a");
+    let verbosity = if model.support_verbosity {
+        model.default_verbosity.as_deref().unwrap_or("enabled")
+    } else {
+        "fixed"
+    };
+    let context_window = model
+        .context_window
+        .map(format_number)
+        .unwrap_or_else(|| "n/a".to_string());
+    let max_context_window = model
+        .max_context_window
+        .map(format_number)
+        .unwrap_or_else(|| "n/a".to_string());
+    let modalities = if model.input_modalities.is_empty() {
+        "text".to_string()
+    } else {
+        model.input_modalities.join(", ")
+    };
+
+    format!(
+        r#"<article class="card">
+  <div class="card-head">
+    <div class="account-title">
+      <h3>{display_name}</h3>
+      <div class="path">{slug}</div>
+    </div>
+    <span class="pill ok">API</span>
+  </div>
+  <div class="card-body">
+    <div class="details">
+      <div class="detail"><div class="k">Think Default</div><div class="v">{think_default}</div></div>
+      <div class="detail"><div class="k">Think Levels</div><div class="v">{reasoning}</div></div>
+      <div class="detail"><div class="k">Modalities</div><div class="v">{modalities}</div></div>
+      <div class="detail"><div class="k">Context</div><div class="v">{context_window}</div></div>
+      <div class="detail"><div class="k">Max Context</div><div class="v">{max_context_window}</div></div>
+      <div class="detail"><div class="k">Verbosity</div><div class="v">{verbosity}</div></div>
+    </div>
+    <div class="subtle" style="margin-top:14px;">{description}</div>
+  </div>
+</article>"#,
+        display_name = html_escape(model.display_name.as_deref().unwrap_or(&model.id)),
+        slug = html_escape(&model.id),
+        think_default = html_escape(think_default),
+        reasoning = html_escape(&reasoning),
+        modalities = html_escape(&modalities),
+        context_window = html_escape(&context_window),
+        max_context_window = html_escape(&max_context_window),
+        verbosity = html_escape(verbosity),
+        description = html_escape(model.description.as_deref().unwrap_or("")),
+    )
+}
+
 fn percent(part: usize, total: usize) -> usize {
     if total == 0 {
         0
     } else {
         ((part as f64 / total as f64) * 100.0).round() as usize
     }
+}
+
+fn format_number(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn bar_class(used: u8) -> &'static str {
@@ -4140,6 +4225,8 @@ async fn main() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
     let quota_probe_interval = Duration::from_secs(args.quota_probe_interval_seconds.max(1));
+    let upstream_timeout = Duration::from_secs(args.upstream_timeout_seconds.max(1));
+    let codex_usage_cache_ttl = Duration::from_secs(args.codex_usage_cache_seconds.max(1));
 
     let proxy = ProxyServer::new(
         &args.auth_paths,
@@ -4149,6 +4236,8 @@ async fn main() -> Result<()> {
         quota_probe_interval,
         args.quota_probe_model.clone(),
         args.quota_probe_input.clone(),
+        upstream_timeout,
+        codex_usage_cache_ttl,
     )
     .await?;
     let health = proxy.health().await;
@@ -4179,6 +4268,14 @@ async fn main() -> Result<()> {
         } else {
             "disabled"
         }
+    );
+    println!(
+        "Upstream timeout: {}s",
+        args.upstream_timeout_seconds.max(1)
+    );
+    println!(
+        "Codex usage cache: {}s",
+        args.codex_usage_cache_seconds.max(1)
     );
     println!(
         "Quota probe: every {}s using model={} input={:?}",
@@ -4242,7 +4339,18 @@ async fn universal_request_handler(
 
     match (method.as_str(), path_str) {
         ("GET", "/") | ("GET", "/dashboard") => {
-            Ok(warp::reply::html(render_dashboard(&proxy.status().await)).into_response())
+            let status = proxy.status().await;
+            let models = proxy.dashboard_models().await;
+            let (model_list, model_error) = match models {
+                Ok(entries) => (entries, None),
+                Err(error) => (vec![], Some(error.to_string())),
+            };
+            Ok(warp::reply::html(render_dashboard(
+                &status,
+                &model_list,
+                model_error.as_deref(),
+            ))
+            .into_response())
         }
         ("GET", "/health") | ("GET", "/healthz") => {
             Ok(warp::reply::json(&proxy.health().await).into_response())
@@ -4383,12 +4491,15 @@ impl Clone for ProxyServer {
         Self {
             client: self.client.clone(),
             account_pool: Arc::clone(&self.account_pool),
+            codex_usage_cache: Arc::clone(&self.codex_usage_cache),
             proxy_bearer_token: self.proxy_bearer_token.clone(),
             responses_api_key: self.responses_api_key.clone(),
             debug_logs: self.debug_logs,
             quota_probe_interval: self.quota_probe_interval,
             quota_probe_model: self.quota_probe_model.clone(),
             quota_probe_input: self.quota_probe_input.clone(),
+            upstream_timeout: self.upstream_timeout,
+            codex_usage_cache_ttl: self.codex_usage_cache_ttl,
         }
     }
 }
@@ -4613,12 +4724,15 @@ mod tests {
                 accounts: vec![],
                 next_index: 0,
             })),
+            codex_usage_cache: Arc::new(Mutex::new(BTreeMap::new())),
             proxy_bearer_token: None,
             responses_api_key: None,
             debug_logs: false,
             quota_probe_interval: Duration::from_secs(3600),
             quota_probe_model: "text-embedding-3-small".to_string(),
             quota_probe_input: "hi".to_string(),
+            upstream_timeout: Duration::from_secs(300),
+            codex_usage_cache_ttl: Duration::from_secs(3600),
         };
 
         let request = ChatCompletionsRequest {
@@ -4666,12 +4780,15 @@ mod tests {
                 accounts: vec![],
                 next_index: 0,
             })),
+            codex_usage_cache: Arc::new(Mutex::new(BTreeMap::new())),
             proxy_bearer_token: None,
             responses_api_key: None,
             debug_logs: false,
             quota_probe_interval: Duration::from_secs(3600),
             quota_probe_model: "text-embedding-3-small".to_string(),
             quota_probe_input: "hi".to_string(),
+            upstream_timeout: Duration::from_secs(300),
+            codex_usage_cache_ttl: Duration::from_secs(3600),
         };
 
         let request = ChatCompletionsRequest {
@@ -4735,12 +4852,15 @@ mod tests {
                 accounts: vec![],
                 next_index: 0,
             })),
+            codex_usage_cache: Arc::new(Mutex::new(BTreeMap::new())),
             proxy_bearer_token: None,
             responses_api_key: None,
             debug_logs: false,
             quota_probe_interval: Duration::from_secs(3600),
             quota_probe_model: "text-embedding-3-small".to_string(),
             quota_probe_input: "hi".to_string(),
+            upstream_timeout: Duration::from_secs(300),
+            codex_usage_cache_ttl: Duration::from_secs(3600),
         };
 
         let request = ChatCompletionsRequest {
@@ -4793,12 +4913,15 @@ mod tests {
                 accounts: vec![],
                 next_index: 0,
             })),
+            codex_usage_cache: Arc::new(Mutex::new(BTreeMap::new())),
             proxy_bearer_token: None,
             responses_api_key: None,
             debug_logs: false,
             quota_probe_interval: Duration::from_secs(3600),
             quota_probe_model: "text-embedding-3-small".to_string(),
             quota_probe_input: "hi".to_string(),
+            upstream_timeout: Duration::from_secs(300),
+            codex_usage_cache_ttl: Duration::from_secs(3600),
         };
 
         let request = ChatCompletionsRequest {
@@ -4918,6 +5041,94 @@ mod tests {
             extract_response_output_text(&payload).as_deref(),
             Some("## Page 1\nhello")
         );
+    }
+
+    #[test]
+    fn builds_models_api_response_from_codex_models() {
+        let response = build_models_api_response(vec![
+            CodexModel {
+                slug: "gpt-5.4".to_string(),
+                display_name: Some("GPT-5.4".to_string()),
+                description: Some("Coding model".to_string()),
+                input_modalities: vec!["text".to_string(), "image".to_string()],
+                context_window: Some(272000),
+                max_context_window: Some(272000),
+                default_reasoning_level: Some("medium".to_string()),
+                supported_reasoning_levels: vec![
+                    ModelReasoningLevel {
+                        effort: "low".to_string(),
+                        description: Some("Fast".to_string()),
+                    },
+                    ModelReasoningLevel {
+                        effort: "high".to_string(),
+                        description: None,
+                    },
+                ],
+                default_verbosity: Some("low".to_string()),
+                support_verbosity: true,
+                supports_parallel_tool_calls: true,
+                supports_search_tool: true,
+                supported_in_api: true,
+                visibility: "list".to_string(),
+            },
+            CodexModel {
+                slug: "codex-auto-review".to_string(),
+                display_name: Some("Codex Auto Review".to_string()),
+                description: None,
+                input_modalities: vec!["text".to_string()],
+                context_window: None,
+                max_context_window: None,
+                default_reasoning_level: Some("medium".to_string()),
+                supported_reasoning_levels: vec![],
+                default_verbosity: None,
+                support_verbosity: false,
+                supports_parallel_tool_calls: false,
+                supports_search_tool: false,
+                supported_in_api: true,
+                visibility: "hide".to_string(),
+            },
+        ]);
+
+        assert_eq!(response.object, "list");
+        assert_eq!(response.data.len(), 1);
+        assert_eq!(response.data[0].id, "gpt-5.4");
+        assert_eq!(
+            response.data[0].default_reasoning_level.as_deref(),
+            Some("medium")
+        );
+        assert_eq!(
+            response.data[0]
+                .supported_reasoning_levels
+                .iter()
+                .map(|level| level.effort.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "high"]
+        );
+    }
+
+    #[test]
+    fn extracts_codex_usage_reset_credits() {
+        let snapshot = codex_usage_snapshot_from_value(json!({
+            "dailyUsageBuckets": [],
+            "rateLimits": {"codex": {"primary": {"usedPercent": 10}}},
+            "rateLimitResetCredits": {
+                "remaining": 1,
+                "total": 2,
+                "resetsAt": 1782929000
+            }
+        }));
+
+        assert!(snapshot.error.is_none());
+        assert_eq!(
+            snapshot
+                .reset_credits
+                .as_ref()
+                .and_then(|value| value.get("remaining"))
+                .and_then(Value::as_i64),
+            Some(1)
+        );
+        assert!(snapshot.rate_limits.is_some());
+        assert!(render_reset_credits_summary(Some(&snapshot)).starts_with("1 of 2 until "));
     }
 
     fn make_jwt_with_exp(exp: i64) -> String {
